@@ -10,6 +10,7 @@ Initially built for my Home Assistant integration [ha-mycloud](https://github.co
 * Fetches system info, share names, network status, and more.
 * Asynchronous library using `asyncio` and `client`.
 * Supports V2 and V5 WD NAS firmware.
+* Reports OS 5 RAID diagnostics and per-volume capacity usage.
 
 ---
 
@@ -30,6 +31,7 @@ Here is a basic example of how to connect and pull data:
 ```python
 import asyncio
 from wdnas_client import client
+from wdnas_client.exceptions import UptimeUnavailableError
 
 async def main():
     username = input("Username: ").lower()
@@ -54,9 +56,17 @@ async def main():
 
         # V5 systems only
         if version == 5:
-            print("Cloud Access:", await wdNAS.cloud_access())
+            print("Diagnostics:", await wdNAS.diagnostics())
+            print("Capacity Usage:", await wdNAS.capacity_usage())
             print("USB Info:", await wdNAS.usb_info())
-            print("Uptime:", await wdNAS.uptime())
+
+            # Not every OS 5 model exposes uptime through the WD API.
+            try:
+                print("Uptime:", await wdNAS.uptime())
+            except UptimeUnavailableError as error:
+                print("Uptime unavailable:", error)
+
+            print("Cloud Access:", await wdNAS.cloud_access())
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -73,3 +83,13 @@ For more detailed information, please see the `docs` folder:
 
 * **[API Reference](./docs/API.md)**
     * A detailed breakdown of the V2 and V5 API endpoints this integration uses.
+
+## WD My Cloud Mirror (OS 5)
+
+WD My Cloud Mirror firmware 5.33.102 has been tested on real hardware. Login,
+system/device/status/network information, shares, accounts, alerts, diagnostics,
+and capacity usage work. With no USB device connected, the NAS returns
+`{"success": false}`; this is returned as data and is not treated as a transport
+error. The tested firmware returns HTTP 500 for the uptime endpoint, so callers
+should catch `UptimeUnavailableError` (which remains a subclass of
+`RequestFailedError`). See the API reference for response shapes and limits.

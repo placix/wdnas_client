@@ -1,10 +1,52 @@
 import aiohttp, json, base64
 import re
 from datetime import timedelta
-from .exceptions import InvalidLoginError, RequestFailedError
+from .exceptions import InvalidLoginError, RequestFailedError, UptimeUnavailableError
 from .const import V2_RAW_LOGIN_STRING, SCHEME, ENDPOINTS
 from xml.etree import ElementTree
 import http.cookies
+
+
+def _optional_int(value):
+    """Return an integer for numeric XML text, preserving other values."""
+    if value is None:
+        return None
+    value = value.strip()
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def _xml_value(element):
+    """Convert arbitrary XML into JSON-compatible data without dropping fields."""
+    children = list(element)
+    if not children:
+        value = _optional_int(element.text)
+    else:
+        value = _xml_children(element)
+
+    if element.attrib:
+        if not isinstance(value, dict):
+            value = {"value": value}
+        value["attributes"] = dict(element.attrib)
+    return value
+
+
+def _xml_children(element, excluded=()):
+    """Return selected XML children while preserving repeated tag names."""
+    result = {}
+    for child in element:
+        if child.tag in excluded:
+            continue
+        value = _xml_value(child)
+        if child.tag in result:
+            if not isinstance(result[child.tag], list):
+                result[child.tag] = [result[child.tag]]
+            result[child.tag].append(value)
+        else:
+            result[child.tag] = value
+    return result
 
 class client:
     """
@@ -465,6 +507,98 @@ class client:
                 return len(alerts_list), alerts_list
             else:
                 raise RequestFailedError(response.status)
+
+    async def diagnostics(self) -> dict:
+        """Fetch disk, fan, board, and RAID diagnostic information."""
+        if self.version != 5:
+            raise ValueError("Unsupported/invalid version. Must be 5.")
+
+        url = f"{SCHEME}{self.host}{ENDPOINTS[self.version]['diagnostics']}"
+        headers = {
+            "Host": self.host,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        async with self.session.post(url, data="cmd=2", headers=headers) as response:
+            if response.status != 200:
+                raise RequestFailedError(response.status)
+
+            root = ElementTree.fromstring(await response.text())
+            known_root_fields = {"board_temperature", "fan", "hd_status", "raid"}
+            hd_status = root.find("hd_status")
+            raid = root.find("raid")
+            result = {
+                "board_temperature": _optional_int(root.findtext("board_temperature")),
+                "fan_rpm": _optional_int(root.findtext("fan")),
+                "disk_statuses": [disk.text for disk in root.findall("./hd_status/disk")],
+                "disk_status_extra": (
+                    _xml_children(hd_status, {"disk"})
+                    if hd_status is not None
+                    else {}
+                ),
+                "raid": {
+                    "volume_count": _optional_int(raid.findtext("cntVol")) if raid is not None else None,
+                    "result": _optional_int(raid.findtext("res")) if raid is not None else None,
+                    "disk_count": _optional_int(raid.findtext("cntDisk")) if raid is not None else None,
+                    "volumes": [],
+                    "extra": {},
+                },
+                "extra": {},
+            }
+
+            if raid is not None:
+                for item in raid.findall("item"):
+                    known_item_fields = {"num", "vol", "raidmode", "state"}
+                    result["raid"]["volumes"].append({
+                        "id": item.get("id"),
+                        "number": _optional_int(item.findtext("num")),
+                        "volume": item.findtext("vol"),
+                        "mode": item.findtext("raidmode"),
+                        "state": item.findtext("state"),
+                        "extra": _xml_children(item, known_item_fields),
+                    })
+                result["raid"]["extra"] = _xml_children(
+                    raid, {"cntVol", "res", "cntDisk", "item"}
+                )
+
+            result["extra"] = _xml_children(root, known_root_fields)
+            return result
+
+    async def capacity_usage(self) -> list:
+        """Return per-volume capacity values in the API's raw KiB units."""
+        if self.version != 5:
+            raise ValueError("Unsupported/invalid version. Must be 5.")
+
+        url = f"{SCHEME}{self.host}{ENDPOINTS[self.version]['capacity_usage']}"
+        headers = {
+            "Host": self.host,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        async with self.session.post(
+            url, data="cmd=cgi_Status_CapacityUsage", headers=headers
+        ) as response:
+            if response.status != 200:
+                raise RequestFailedError(response.status)
+
+            root = ElementTree.fromstring(await response.text())
+            field_names = {
+                "volume": "volume",
+                "total_size": "total_size",
+                "use_size": "used_size",
+                "free_size": "free_size",
+                "used_rate": "used_rate",
+                "Shared_Pictures": "shared_pictures",
+                "Shared_Music": "shared_music",
+                "Shared_Videos": "shared_videos",
+            }
+            volumes = []
+            for item in root.findall(".//item"):
+                volume = {
+                    output_name: _optional_int(item.findtext(xml_name))
+                    for xml_name, output_name in field_names.items()
+                }
+                volume["extra"] = _xml_children(item, field_names)
+                volumes.append(volume)
+            return volumes
     
     async def cloud_access(self) -> dict:
         """
@@ -506,7 +640,7 @@ class client:
             "Host": self.host
         }
 
-        async with self.session.post(url, headers=headers) as response:
+        async with self.session.get(url, headers=headers) as response:
             if response.status == 200:
                 content = await response.text()
                 json_content = json.loads(content)
@@ -533,14 +667,16 @@ class client:
         data = "cmd=cgi_get_uptime"
     
         async with self.session.post(url, data=data, headers=headers) as response:
-            if response.status != 200:
-                raise RequestFailedError(response.status)
-    
             text = await response.text()
+
+            if response.status != 200:
+                if response.status == 500 and not text.strip():
+                    raise UptimeUnavailableError(response.status)
+                raise RequestFailedError(response.status)
     
             match = re.search(r"<uptime>(.*?)</uptime>", text, re.S)
             if not match:
-                raise RequestFailedError("Uptime not found in XML response.")
+                raise UptimeUnavailableError()
     
             uptime_raw = match.group(1).strip()
     
@@ -551,7 +687,7 @@ class client:
             )
     
             if not match:
-                raise RequestFailedError(f"Unexpected uptime format: {uptime_raw}")
+                raise UptimeUnavailableError()
     
             d, h, m = map(int, match.groups())
             return int(timedelta(days=d, hours=h, minutes=m).total_seconds())

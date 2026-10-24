@@ -1,11 +1,12 @@
 import asyncio
 from wdnas_client import client
+from wdnas_client.exceptions import UptimeUnavailableError
 
 async def main():
     username = input("Username: ").lower()
     password = input("Password: ")
-    host = '192.168.86.41'
-    version = 2 # Can be 2 or 5
+    host = input("NAS IP address: ").strip()
+    version = int(input("API version (2 or 5): ").strip())
     
     async with client(username, password, host, version) as wdNAS:
         # V2 and V5 systems
@@ -24,9 +25,15 @@ async def main():
 
         # V5 systems only
         if version == 5:
-            print("Cloud Access:", await wdNAS.cloud_access())
+            print("Diagnostics:", await wdNAS.diagnostics())
+            print("Capacity Usage:", await wdNAS.capacity_usage())
             print("USB Info:", await wdNAS.usb_info())
-            print("Uptime:", await wdNAS.uptime())
+            try:
+                print("Uptime:", await wdNAS.uptime())
+            except UptimeUnavailableError as error:
+                print("Uptime unavailable:", error)
+
+            print("Cloud Access:", await wdNAS.cloud_access())
 
 if __name__ == "__main__":
     asyncio.run(main())

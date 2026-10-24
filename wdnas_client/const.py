@@ -13,7 +13,7 @@ ENDPOINTS = {
         "system_version": "/cgi-bin/system_mgr.cgi",
         "latest_version": "/cgi-bin/system_mgr.cgi",
         "accounts": "/xml/account.xml",
-        "alerts": "/cgi-bin/system_mgr.cgi"
+        "alerts": "/cgi-bin/system_mgr.cgi",
     },
     5: {
         "login": "/nas/v1/auth",
@@ -25,6 +25,8 @@ ENDPOINTS = {
         "system_version": "/cgi-bin/system_mgr.cgi",
         "latest_version": "/cgi-bin/system_mgr.cgi",
         "accounts": "/xml/account.xml",
-        "alerts": "/cgi-bin/system_mgr.cgi"
+        "alerts": "/cgi-bin/system_mgr.cgi",
+        "diagnostics": "/cgi-bin/home_mgr.cgi",
+        "capacity_usage": "/cgi-bin/hd_config.cgi",
     }
 }

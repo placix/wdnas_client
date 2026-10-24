@@ -33,7 +33,11 @@ This document outlines the API endpoints for the WD NAS systems supported by thi
 | Cloud Access | `POST` | `/web/restSDK/cloudAccess.php` | `cmd=getCloudAccess` | `application/x-www-form-urlencoded` body |
 | USB Info | `GET` | `/web/get_usb_info.php` | *None* | `success: false` can mean that no USB device is attached |
 | Diagnostics | `POST` | `/cgi-bin/home_mgr.cgi` | `cmd=2` | Disk, fan, board, and RAID data |
-| Capacity Usage | `POST` | `/cgi-bin/hd_config.cgi` | `cmd=cgi_Status_CapacityUsage` | Per-volume raw KiB counters and percentage |
+| Capacity Usage | `POST` | `/cgi-bin/hd_config.cgi` | `cmd=cgi_Status_CapacityUsage` | Raw capacity/media counters and percentage |
+| Volume Status | `GET` | `/xml/used_volume_info.xml` | *None* | Detailed volume, filesystem, mount, encryption, and RAID values |
+| System Warning | `POST` | `/cgi-bin/home_mgr.cgi` | `cmd=8` | Temperature/busy warning code |
+| Internet Access | `GET` | `/cgi-bin/network_mgr.cgi?cmd=cgi_get_internet_access` | *None* | Connectivity assessment made by the NAS |
+| Process Info | `POST` | `/cgi-bin/status_mgr.cgi` | `cmd=cgi_process` | Diagnostic process list |
 | Uptime | `POST` | `/cgi-bin/status_mgr.cgi` | `cmd=cgi_get_uptime` | Not available on all OS 5 models |
 
 ## Method responses and compatibility
@@ -71,8 +75,9 @@ OS 5 only. The method returns a dictionary with this shape:
 `board_temperature` is a WD diagnostic code, not a Celsius temperature.
 `fan_rpm` is the RPM value reported by the firmware; zero is not interpreted as
 healthy or unhealthy. RAID states are returned verbatim. Known values include
-`clean`, `degraded`, `damaged`, `resync`, `recovery`, `migrate`, `reshape`, and
-`expansion`. Missing known elements become `None` (or an empty list), while
+`clean`, `degraded`, `damaged`, `resync`, `resync5` (parity verification),
+`recovery`, `migrate`, `reshape`, and `expansion`. Missing known elements become
+`None` (or an empty list), while
 additional XML values are retained in the nearest `extra` mapping.
 
 The WD My Cloud Mirror response shown above was verified on real firmware
@@ -100,13 +105,156 @@ without loss:
 ]
 ```
 
-The WD web-interface code treats `total_size`, `use_size`, `free_size`, and the
-three media-category values as KiB counters. The client returns those integers
-unchanged; it does not convert or reconcile them with `system_info()`, whose
-endpoint may report different storage figures. `used_rate` is an integer
+The WD web-interface code treats `use_size` and `free_size` as KiB block counts.
+`total_size` is inferred to use the same unit from its live magnitude and field
+relationship. `Shared_Pictures`, `Shared_Music`, and `Shared_Videos` appear to
+already be byte values because the WD code does not multiply them by 1024 before
+combining them with capacity values. These unit conclusions are derived from WD
+code and are not a published protocol contract. The client returns every raw
+integer unchanged; it does not convert or reconcile values with `system_info()`,
+whose endpoint may report different storage figures. `used_rate` is an integer
 percentage. Missing values become `None`, and additional item fields are kept in
 `extra`. One-volume behavior was verified on real Mirror firmware 5.33.102;
 multi-volume parsing is fixture-tested.
+
+### `await nas.volume_status()`
+
+OS 5 only. Performs the read-only `GET /xml/used_volume_info.xml` request and
+returns one dictionary per volume. Known fields include `volume`, `raid_mode`,
+`raid_status`, `file_type`, `size`, `used_size`, `free_size`, `percentage`,
+`device`, `dev_num`, `mount`, `mount_status`, `volume_encrypt`,
+`is_roaming_volume`, `scsi_mapping`, `spare`, `to_be_sync`, and `web_cmd`.
+Numerical text is converted to integers where appropriate; missing fields become
+`None`, and unknown fields are retained in `extra`. RAID status codes are raw
+values and are not interpreted. The live values for `size`, `used_size`, and
+`free_size` are consistent with KiB block counts, but this remains an
+implementation-derived interpretation rather than a published contract.
+
+```python
+[
+    {
+        "volume": 1,
+        "raid_mode": "raid1",
+        "raid_status": 0,
+        "file_type": "ext4",
+        "size": 1918590988,
+        "used_size": 1918484104,
+        "free_size": 106884,
+        "percentage": 0,
+        "device": "sdasdb",
+        "dev_num": 2,
+        "mount": "...",
+        "mount_status": "...",
+        "volume_encrypt": 0,
+        "is_roaming_volume": 0,
+        "scsi_mapping": 3,
+        "spare": None,
+        "to_be_sync": None,
+        "web_cmd": 9,
+        "sdx3_flag": 0,
+        "used_device": "...",
+        "raid_uuid": "...",
+        "scsi0_serial": "...",
+        "scsi1_serial": "...",
+        "extra": {},
+    }
+]
+```
+
+On the tested, almost-full Mirror volume, `percentage` was still `0`. It is
+therefore an uninterpreted firmware value and must not be presented as storage
+utilization without further evidence. Use neither this field nor an inferred
+formula as a substitute for the separately reported capacity values.
+
+`volume_status().free_size` and `capacity_usage().free_size` differed in the
+same live test. They come from separate WD endpoints
+(`/xml/used_volume_info.xml` and `/cgi-bin/hd_config.cgi` respectively), and the
+client deliberately preserves both raw values without reconciling them.
+
+The response can also expose `mount`, device identifiers, `raid_uuid`, and SCSI
+serial numbers. They remain available for diagnostics but should be redacted
+from logs and issue reports. The client does not log them. This method performs
+no RAID or configuration operation.
+
+### `await nas.system_warning()`
+
+OS 5 only. Returns `{"code": 0, "status": "normal"}` for warning code 0.
+Known statuses are `normal`, `over_temperature`, and `system_busy_hotplug` for
+codes 0, 1, and 2. Any other value is returned unchanged in `code` with status
+`unknown`; it is never treated as normal.
+
+### `await nas.internet_access()`
+
+OS 5 only. Returns `True` or `False` from the NAS-reported `connectivity` value.
+It does not contact any external service or perform its own DNS/HTTP test.
+Missing or unexpected values raise `ValueError` instead of being collapsed to
+`False`; HTTP failures raise `RequestFailedError`.
+
+### `await nas.process_info()`
+
+OS 5 only. Returns a list containing `command`, `user`, `pid`, `cpu`, `mem`, and
+`extra`. Integer/decimal values are typed where possible; malformed values are
+preserved to avoid data loss. WD JavaScript sorts and displays `cpu` directly
+but does not establish a protocol-level unit, and no reliable unit for `mem` was
+found, so both remain raw measurements. Commands, usernames, and PIDs are
+potentially sensitive and the library does not log the list. The method is for
+diagnostics and does not control processes.
+
+```python
+[
+    {
+        "command": "...",
+        "user": "...",
+        "pid": 1234,
+        "cpu": 2.1,
+        "mem": 1580,
+        "extra": {},
+    }
+]
+```
+
+### `await nas.system_status()` additions
+
+The original `cpu` and `memory.total`, `memory.unused`, and `memory.simple`
+keys and types remain unchanged. When supplied by the firmware, the result also
+contains `memory.buffers`, `memory.cached`, `bonding`, `now_time`,
+`process_count`, and raw interface values under `network.lan` and
+`network.lan2`. The memory counters are treated as raw KiB values based on the
+WD UI calculations. `now_time` is a Unix sample timestamp, not uptime.
+
+The WD UI divides each LAN value by 1024 twice and displays MB/s without taking
+a counter difference. Because the underlying API semantics are not formally
+documented, the client exposes them as `received_raw`/`transmitted_raw`, does not
+add duplicate-looking interfaces, and does not promise bytes per second.
+Unknown top-level resource fields are retained in `extra`. `process_count` is
+derived only when actual `process_main` records are present.
+
+```python
+{
+    "memory": {
+        "total": 509780,
+        "unused": 20500,
+        "simple": "512MB",
+        "buffers": 31360,
+        "cached": 220544,
+    },
+    "cpu": 4,
+    "bonding": 0,
+    "now_time": 1792870243,
+    "process_count": 51,
+    "network": {
+        "lan": {"received_raw": 13191338173, "transmitted_raw": 11278793837},
+        "lan2": {"received_raw": 13191338173, "transmitted_raw": 11278793837},
+    },
+    "extra": {},
+}
+```
+
+### Disk Manager progress limitation
+
+`GET /xml/dm_read_state.xml` returned HTTP 404 on the tested Mirror firmware
+5.33.102. It may be firmware- or operation-state-dependent, so no public method
+or polling behavior is provided and no RAID operation is initiated to expose it.
 
 ### `await nas.usb_info()`
 

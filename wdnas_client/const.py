@@ -28,5 +28,9 @@ ENDPOINTS = {
         "alerts": "/cgi-bin/system_mgr.cgi",
         "diagnostics": "/cgi-bin/home_mgr.cgi",
         "capacity_usage": "/cgi-bin/hd_config.cgi",
+        "volume_status": "/xml/used_volume_info.xml",
+        "system_warning": "/cgi-bin/home_mgr.cgi",
+        "internet_access": "/cgi-bin/network_mgr.cgi?cmd=cgi_get_internet_access",
+        "process_info": "/cgi-bin/status_mgr.cgi",
     }
 }

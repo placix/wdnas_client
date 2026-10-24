@@ -10,7 +10,8 @@ Initially built for my Home Assistant integration [ha-mycloud](https://github.co
 * Fetches system info, share names, network status, and more.
 * Asynchronous library using `asyncio` and `client`.
 * Supports V2 and V5 WD NAS firmware.
-* Reports OS 5 RAID diagnostics and per-volume capacity usage.
+* Reports OS 5 RAID diagnostics, detailed volume state, resource monitoring,
+  process diagnostics, warning state, and NAS-reported internet connectivity.
 
 ---
 
@@ -30,12 +31,13 @@ Here is a basic example of how to connect and pull data:
 
 ```python
 import asyncio
+import getpass
 from wdnas_client import client
 from wdnas_client.exceptions import UptimeUnavailableError
 
 async def main():
     username = input("Username: ").lower()
-    password = input("Password: ")
+    password = getpass.getpass("Password: ")
     host = '192.168.1.42'
     version = 2 # Can be 2 or 5
     
@@ -58,6 +60,12 @@ async def main():
         if version == 5:
             print("Diagnostics:", await wdNAS.diagnostics())
             print("Capacity Usage:", await wdNAS.capacity_usage())
+            print("Volume Status:", await wdNAS.volume_status())
+            print("System Warning:", await wdNAS.system_warning())
+            print("Internet Access:", await wdNAS.internet_access())
+            # Avoid printing sensitive commands, users, and PIDs by default.
+            processes = await wdNAS.process_info()
+            print("Process Count:", len(processes))
             print("USB Info:", await wdNAS.usb_info())
 
             # Not every OS 5 model exposes uptime through the WD API.
@@ -88,7 +96,9 @@ For more detailed information, please see the `docs` folder:
 
 WD My Cloud Mirror firmware 5.33.102 has been tested on real hardware. Login,
 system/device/status/network information, shares, accounts, alerts, diagnostics,
-and capacity usage work. With no USB device connected, the NAS returns
+capacity usage, detailed volume state, warning state, NAS-reported internet
+connectivity, and process diagnostics work. With no USB device connected, the
+NAS returns
 `{"success": false}`; this is returned as data and is not treated as a transport
 error. The tested firmware returns HTTP 500 for the uptime endpoint, so callers
 should catch `UptimeUnavailableError` (which remains a subclass of

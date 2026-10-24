@@ -18,6 +18,17 @@ def _optional_int(value):
         return value
 
 
+def _optional_number(value):
+    """Return an int/float for numeric XML text, preserving other values."""
+    value = _optional_int(value)
+    if not isinstance(value, str):
+        return value
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
 def _xml_value(element):
     """Convert arbitrary XML into JSON-compatible data without dropping fields."""
     children = list(element)
@@ -249,6 +260,49 @@ class client:
                 json_device_status['memory']['total'] = int(device_status.find('.//mem_total').text)
                 json_device_status['memory']['unused'] = int(device_status.find('.//mem_free').text)
                 json_device_status['memory']['simple'] = device_status.find('.//mem2_total').text
+
+                for xml_name, output_name in (
+                    ("buffers", "buffers"),
+                    ("cached", "cached"),
+                ):
+                    value = device_status.findtext(f".//{xml_name}")
+                    if value is not None:
+                        json_device_status["memory"][output_name] = _optional_int(value)
+
+                for xml_name, output_name in (
+                    ("bonding", "bonding"),
+                    ("now_time", "now_time"),
+                ):
+                    value = device_status.findtext(f".//{xml_name}")
+                    if value is not None:
+                        json_device_status[output_name] = _optional_int(value)
+
+                network_fields = {
+                    "lan_r_speed": ("lan", "received_raw"),
+                    "lan_t_speed": ("lan", "transmitted_raw"),
+                    "lan2_r_speed": ("lan2", "received_raw"),
+                    "lan2_t_speed": ("lan2", "transmitted_raw"),
+                }
+                network = {}
+                for xml_name, (interface, output_name) in network_fields.items():
+                    value = device_status.findtext(f".//{xml_name}")
+                    if value is not None:
+                        network.setdefault(interface, {})[output_name] = _optional_int(value)
+                if network:
+                    json_device_status["network"] = network
+
+                processes = device_status.findall(".//process_main")
+                if processes:
+                    json_device_status["process_count"] = len(processes)
+
+                known_fields = {
+                    "bonding", "buffers", "cached", "cpu", "lan_r_speed",
+                    "lan_t_speed", "lan2_r_speed", "lan2_t_speed", "mem_total",
+                    "mem2_total", "mem_free", "now_time", "process_main",
+                }
+                extra = _xml_children(device_status, known_fields)
+                if extra:
+                    json_device_status["extra"] = extra
                 return json_device_status
             else:
                 raise RequestFailedError(response.status)
@@ -564,7 +618,7 @@ class client:
             return result
 
     async def capacity_usage(self) -> list:
-        """Return per-volume capacity values in the API's raw KiB units."""
+        """Return the API's raw per-volume capacity and media-category values."""
         if self.version != 5:
             raise ValueError("Unsupported/invalid version. Must be 5.")
 
@@ -599,6 +653,118 @@ class client:
                 volume["extra"] = _xml_children(item, field_names)
                 volumes.append(volume)
             return volumes
+
+    async def volume_status(self) -> list:
+        """Return detailed read-only volume, filesystem, and RAID status."""
+        if self.version != 5:
+            raise ValueError("Unsupported/invalid version. Must be 5.")
+
+        url = f"{SCHEME}{self.host}{ENDPOINTS[self.version]['volume_status']}"
+        headers = {"Host": self.host}
+        async with self.session.get(url, headers=headers) as response:
+            if response.status != 200:
+                raise RequestFailedError(response.status)
+
+            root = ElementTree.fromstring(await response.text())
+            numeric_fields = {
+                "volume", "web_cmd", "sdx3_flag", "raid_status", "size",
+                "used_size", "free_size", "percentage", "dev_num",
+                "volume_encrypt", "scsi_mapping", "is_roaming_volume",
+            }
+            known_fields = {
+                "volume", "raid_mode", "raid_status", "file_type", "size",
+                "used_size", "free_size", "percentage", "device", "dev_num",
+                "mount", "mount_status", "volume_encrypt", "is_roaming_volume",
+                "scsi_mapping", "spare", "to_be_sync", "web_cmd", "sdx3_flag",
+                "used_device", "raid_uuid", "scsi0_serial", "scsi1_serial",
+            }
+            volume_info = root if root.tag == "volume_info" else root.find(".//volume_info")
+            volumes = []
+            items = volume_info.findall("item") if volume_info is not None else []
+            for item in items:
+                volume = {}
+                for field in known_fields:
+                    value = item.findtext(field)
+                    volume[field] = (
+                        _optional_int(value) if field in numeric_fields else value
+                    )
+                volume["extra"] = _xml_children(item, known_fields)
+                volumes.append(volume)
+            return volumes
+
+    async def system_warning(self) -> dict:
+        """Return the OS 5 temperature/busy warning code and known meaning."""
+        if self.version != 5:
+            raise ValueError("Unsupported/invalid version. Must be 5.")
+
+        url = f"{SCHEME}{self.host}{ENDPOINTS[self.version]['system_warning']}"
+        headers = {
+            "Host": self.host,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        async with self.session.post(url, data="cmd=8", headers=headers) as response:
+            if response.status != 200:
+                raise RequestFailedError(response.status)
+
+            root = ElementTree.fromstring(await response.text())
+            code = _optional_int(root.findtext(".//res"))
+            statuses = {
+                0: "normal",
+                1: "over_temperature",
+                2: "system_busy_hotplug",
+            }
+            return {"code": code, "status": statuses.get(code, "unknown")}
+
+    async def internet_access(self) -> bool:
+        """Return only the internet-connectivity assessment reported by the NAS."""
+        if self.version != 5:
+            raise ValueError("Unsupported/invalid version. Must be 5.")
+
+        url = f"{SCHEME}{self.host}{ENDPOINTS[self.version]['internet_access']}"
+        async with self.session.get(url, headers={"Host": self.host}) as response:
+            if response.status != 200:
+                raise RequestFailedError(response.status)
+
+            root = ElementTree.fromstring(await response.text())
+            value = root.findtext(".//connectivity")
+            if value is None:
+                raise ValueError("NAS response has no connectivity value")
+            normalized = value.strip().lower()
+            if normalized == "true":
+                return True
+            if normalized == "false":
+                return False
+            raise ValueError(f"Unknown NAS connectivity value: {value!r}")
+
+    async def process_info(self) -> list:
+        """Return the diagnostic process list reported by OS 5."""
+        if self.version != 5:
+            raise ValueError("Unsupported/invalid version. Must be 5.")
+
+        url = f"{SCHEME}{self.host}{ENDPOINTS[self.version]['process_info']}"
+        headers = {
+            "Host": self.host,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        async with self.session.post(
+            url, data="cmd=cgi_process", headers=headers
+        ) as response:
+            if response.status != 200:
+                raise RequestFailedError(response.status)
+
+            root = ElementTree.fromstring(await response.text())
+            processes = []
+            for item in root.findall(".//process_main"):
+                known_fields = {"command", "user", "pid", "cpu", "mem"}
+                processes.append({
+                    "command": item.findtext("command"),
+                    "user": item.findtext("user"),
+                    "pid": _optional_int(item.findtext("pid")),
+                    "cpu": _optional_number(item.findtext("cpu")),
+                    "mem": _optional_number(item.findtext("mem")),
+                    "extra": _xml_children(item, known_fields),
+                })
+            return processes
     
     async def cloud_access(self) -> dict:
         """

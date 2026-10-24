@@ -1,10 +1,11 @@
 import asyncio
+import getpass
 from wdnas_client import client
 from wdnas_client.exceptions import UptimeUnavailableError
 
 async def main():
     username = input("Username: ").lower()
-    password = input("Password: ")
+    password = getpass.getpass("Password: ")
     host = input("NAS IP address: ").strip()
     version = int(input("API version (2 or 5): ").strip())
     
@@ -27,6 +28,12 @@ async def main():
         if version == 5:
             print("Diagnostics:", await wdNAS.diagnostics())
             print("Capacity Usage:", await wdNAS.capacity_usage())
+            print("Volume Status:", await wdNAS.volume_status())
+            print("System Warning:", await wdNAS.system_warning())
+            print("Internet Access (reported by NAS):", await wdNAS.internet_access())
+            # Avoid printing sensitive commands, users, and PIDs by default.
+            processes = await wdNAS.process_info()
+            print("Process Count:", len(processes))
             print("USB Info:", await wdNAS.usb_info())
             try:
                 print("Uptime:", await wdNAS.uptime())

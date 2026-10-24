@@ -25,8 +25,13 @@ This document outlines the supported WD NAS systems.
 
 For the WD My Cloud Mirror, login, `system_version()`, `device_info()`,
 `system_info()`, `system_status()`, `network_info()`, `share_names()`,
-`accounts()`, `alerts()`, `diagnostics()`, and `capacity_usage()` were tested on
-the physical device. `usb_info()` was tested without a connected USB device and
+`accounts()`, `alerts()`, `diagnostics()`, `capacity_usage()`, `volume_status()`,
+`system_warning()`, `internet_access()`, `process_info()`, and the extended
+`system_status()` response were tested on the physical device. `usb_info()` was
+tested without a connected USB device and
 returned `{"success": false}`. The documented RAID failure/rebuild variants and
 multi-volume parsing are covered by automated fixtures rather than live fault
-injection. The device returned HTTP 500 with an empty body for `uptime()`.
+injection. The device returned HTTP 500 with an empty body for `uptime()` and
+HTTP 404 for the state-dependent `/xml/dm_read_state.xml` resource. Compatibility
+of the new monitoring methods is asserted only for Mirror firmware 5.33.102;
+other listed OS 5 models retain their existing support status.

@@ -68,6 +68,10 @@ async def main():
             print("Process Count:", len(processes))
             print("USB Info:", await wdNAS.usb_info())
 
+            # Explicit device actions. Each performs the dashboard safety check.
+            # await wdNAS.reboot()
+            # await wdNAS.shutdown()
+
             # Not every OS 5 model exposes uptime through the WD API.
             try:
                 print("Uptime:", await wdNAS.uptime())

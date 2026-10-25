@@ -1,10 +1,20 @@
-import aiohttp, json, base64
+import asyncio
+import base64
+import http.cookies
+import json
 import re
 from datetime import timedelta
-from .exceptions import InvalidLoginError, RequestFailedError, UptimeUnavailableError
-from .const import V2_RAW_LOGIN_STRING, SCHEME, ENDPOINTS
 from xml.etree import ElementTree
-import http.cookies
+
+import aiohttp
+
+from .const import ENDPOINTS, POWER_ACTION_TIMEOUT, SCHEME, V2_RAW_LOGIN_STRING
+from .exceptions import (
+    InvalidLoginError,
+    PowerActionBlockedError,
+    RequestFailedError,
+    UptimeUnavailableError,
+)
 
 
 def _optional_int(value):
@@ -135,11 +145,66 @@ class client:
                     self.wd_csrf_token = cookies["WD-CSRF-TOKEN"].value
                 else:
                     raise InvalidLoginError("Invalid Username/Password or missing cookies")
+            elif self.version == 5 and "PHPSESSID" in cookies:
+                self.phpsessid = cookies["PHPSESSID"].value
             elif self.version == 5:
-                if "PHPSESSID" in cookies:
-                    self.phpsessid = cookies["PHPSESSID"].value
+                raise InvalidLoginError(
+                    "Invalid Username/Password or missing cookies"
+                )
         else:
             raise RequestFailedError(response.status)
+
+    async def _power_action(self, command: str) -> None:
+        """Run a JavaScript-proven OS 5 power command after its safety check."""
+        if self.version != 5:
+            raise ValueError("Unsupported/invalid version. Must be 5.")
+        if (
+            self.session is None
+            or getattr(self.session, "closed", False)
+            or not self.phpsessid
+        ):
+            raise InvalidLoginError("An authenticated NAS session is required")
+
+        headers = {
+            "Host": self.host,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        safety_url = f"{SCHEME}{self.host}{ENDPOINTS[5]['power_safety']}"
+        action_url = f"{SCHEME}{self.host}{ENDPOINTS[5]['power_action']}"
+
+        async with asyncio.timeout(POWER_ACTION_TIMEOUT):
+            async with self.session.post(
+                safety_url, data="cmd=cgi_Detect_Dangerous", headers=headers
+            ) as response:
+                if response.status != 200:
+                    raise RequestFailedError(response.status)
+                root = ElementTree.fromstring(await response.text())
+                result = _optional_int(root.findtext(".//res"))
+                if not isinstance(result, int):
+                    raise TypeError(
+                        "Power safety response did not contain a numeric res"
+                    )
+                if result != 0:
+                    raise PowerActionBlockedError(result)
+
+            try:
+                async with self.session.post(
+                    action_url, data=f"cmd={command}", headers=headers
+                ) as response:
+                    if response.status != 200:
+                        raise RequestFailedError(response.status)
+                    await response.text()
+            except aiohttp.ServerDisconnectedError:
+                # The confirmed command may tear down HTTP before a response body.
+                return
+
+    async def reboot(self) -> None:
+        """Restart a supported OS 5 NAS using its authenticated HTTP session."""
+        await self._power_action("cgi_restart")
+
+    async def shutdown(self) -> None:
+        """Shut down a supported OS 5 NAS using its authenticated HTTP session."""
+        await self._power_action("cgi_shutdown")
     
     async def system_info(self) -> dict:
         """
@@ -840,7 +905,7 @@ class client:
                     raise UptimeUnavailableError(response.status)
                 raise RequestFailedError(response.status)
     
-            match = re.search(r"<uptime>(.*?)</uptime>", text, re.S)
+            match = re.search(r"<uptime>(.*?)</uptime>", text, re.DOTALL)
             if not match:
                 raise UptimeUnavailableError()
     
@@ -849,7 +914,7 @@ class client:
             match = re.search(
                 r"(\d+)\s*days?\s*(\d+)\s*hour[s]?\s*(\d+)\s*minute[s]?",
                 uptime_raw,
-                re.I,
+                re.IGNORECASE,
             )
     
             if not match:

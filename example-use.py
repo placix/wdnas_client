@@ -1,7 +1,9 @@
 import asyncio
 import getpass
+
 from wdnas_client import client
 from wdnas_client.exceptions import UptimeUnavailableError
+
 
 async def main():
     username = input("Username: ").lower()

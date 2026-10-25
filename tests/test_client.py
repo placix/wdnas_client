@@ -1,9 +1,18 @@
+import asyncio
 import http.cookies
 import unittest
+from unittest.mock import patch
 from xml.etree import ElementTree
 
+import aiohttp
+
 from wdnas_client import client
-from wdnas_client.exceptions import RequestFailedError, UptimeUnavailableError
+from wdnas_client.exceptions import (
+    InvalidLoginError,
+    PowerActionBlockedError,
+    RequestFailedError,
+    UptimeUnavailableError,
+)
 
 
 class Headers(dict):
@@ -41,13 +50,14 @@ class CookieJar:
 
 class FakeSession:
     def __init__(self, response):
+        self.responses = list(response) if isinstance(response, (list, tuple)) else None
         self.response = response
         self.calls = []
         self.cookie_jar = CookieJar()
 
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
-        return self.response
+        return self.responses.pop(0) if self.responses is not None else self.response
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
@@ -58,6 +68,11 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     def make_client(self, response, version=5):
         nas = client("Admin", "secret", "nas.local", version)
         nas.session = FakeSession(response)
+        return nas
+
+    def make_power_client(self, response, version=5):
+        nas = self.make_client(response, version)
+        nas.phpsessid = "session-id"
         return nas
 
     async def test_os5_login(self):
@@ -75,6 +90,11 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["json"]["username"], "admin")
         self.assertEqual(kwargs["json"]["password"], "c2VjcmV0")
 
+    async def test_os5_login_requires_session_cookie(self):
+        nas = self.make_client(FakeResponse())
+        with self.assertRaises(InvalidLoginError):
+            await nas.login()
+
     async def test_os2_login_remains_compatible(self):
         cookies = http.cookies.SimpleCookie()
         cookies["PHPSESSID"] = "session-id"
@@ -85,7 +105,9 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nas.phpsessid, "session-id")
         self.assertEqual(nas.wd_csrf_token, "csrf-token")
         method, url, kwargs = nas.session.calls[0]
-        self.assertEqual((method, url), ("POST", "http://nas.local/cgi-bin/login_mgr.cgi"))
+        self.assertEqual(
+            (method, url), ("POST", "http://nas.local/cgi-bin/login_mgr.cgi")
+        )
         self.assertIn("cmd=wd_login", kwargs["data"])
 
     async def test_diagnostics_healthy_raid1(self):
@@ -106,7 +128,16 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nas.session.calls[0][2]["data"], "cmd=2")
 
     async def test_diagnostics_raid_states_and_multiple_volumes(self):
-        for state in ("degraded", "damaged", "resync", "resync5", "recovery", "migrate", "reshape", "expansion"):
+        for state in (
+            "degraded",
+            "damaged",
+            "resync",
+            "resync5",
+            "recovery",
+            "migrate",
+            "reshape",
+            "expansion",
+        ):
             with self.subTest(state=state):
                 xml = f"""<config><raid><cntVol>2</cntVol><cntDisk>2</cntDisk>
                   <item id="1"><num>1</num><vol>A</vol><raidmode>raid1</raidmode><state>{state}</state></item>
@@ -176,10 +207,13 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         xml = """<config><cpu>12%</cpu><mem_total>1024</mem_total>
           <mem_free>256</mem_free><mem2_total>1 GB</mem2_total></config>"""
         result = await self.make_client(FakeResponse(text=xml)).system_status()
-        self.assertEqual(result, {
-            "memory": {"total": 1024, "unused": 256, "simple": "1 GB"},
-            "cpu": 12,
-        })
+        self.assertEqual(
+            result,
+            {
+                "memory": {"total": 1024, "unused": 256, "simple": "1 GB"},
+                "cpu": 12,
+            },
+        )
 
     async def test_existing_uptime_parser(self):
         xml = "<config><uptime>2 days 3 hours 4 minutes</uptime></config>"
@@ -234,7 +268,9 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         }
         for code, status in expected.items():
             with self.subTest(code=code):
-                nas = self.make_client(FakeResponse(text=f"<config><res>{code}</res></config>"))
+                nas = self.make_client(
+                    FakeResponse(text=f"<config><res>{code}</res></config>")
+                )
                 self.assertEqual(
                     await nas.system_warning(), {"code": code, "status": status}
                 )
@@ -243,7 +279,9 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         for value, expected in (("true", True), ("FALSE", False)):
             with self.subTest(value=value):
                 xml = f"<internet_access><connectivity>{value}</connectivity></internet_access>"
-                result = await self.make_client(FakeResponse(text=xml)).internet_access()
+                result = await self.make_client(
+                    FakeResponse(text=xml)
+                ).internet_access()
                 self.assertIs(result, expected)
 
     async def test_internet_access_missing_or_unknown_is_not_false(self):
@@ -251,9 +289,8 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             "<internet_access/>",
             "<internet_access><connectivity>unknown</connectivity></internet_access>",
         ):
-            with self.subTest(xml=xml):
-                with self.assertRaises(ValueError):
-                    await self.make_client(FakeResponse(text=xml)).internet_access()
+            with self.subTest(xml=xml), self.assertRaises(ValueError):
+                await self.make_client(FakeResponse(text=xml)).internet_access()
 
     async def test_process_info_empty_and_multiple(self):
         empty = await self.make_client(FakeResponse(text="<xml/>")).process_info()
@@ -266,10 +303,17 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         </xml>"""
         nas = self.make_client(FakeResponse(text=xml))
         result = await nas.process_info()
-        self.assertEqual(result[0], {
-            "command": "alpha", "user": "root", "pid": 12,
-            "cpu": 28.1, "mem": 1524, "extra": {},
-        })
+        self.assertEqual(
+            result[0],
+            {
+                "command": "alpha",
+                "user": "root",
+                "pid": 12,
+                "cpu": 28.1,
+                "mem": 1524,
+                "extra": {},
+            },
+        )
         self.assertIsNone(result[1]["user"])
         self.assertIsNone(result[1]["mem"])
         self.assertEqual(nas.session.calls[0][2]["data"], "cmd=cgi_process")
@@ -307,7 +351,10 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_methods_http_errors(self):
         for method_name in (
-            "volume_status", "system_warning", "internet_access", "process_info"
+            "volume_status",
+            "system_warning",
+            "internet_access",
+            "process_info",
         ):
             with self.subTest(method=method_name):
                 nas = self.make_client(FakeResponse(status=503))
@@ -316,7 +363,10 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_methods_invalid_xml(self):
         for method_name in (
-            "volume_status", "system_warning", "internet_access", "process_info"
+            "volume_status",
+            "system_warning",
+            "internet_access",
+            "process_info",
         ):
             with self.subTest(method=method_name):
                 nas = self.make_client(FakeResponse(text="<invalid"))
@@ -325,13 +375,113 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_methods_are_os5_only(self):
         for method_name in (
-            "volume_status", "system_warning", "internet_access", "process_info"
+            "volume_status",
+            "system_warning",
+            "internet_access",
+            "process_info",
         ):
             with self.subTest(method=method_name):
                 nas = self.make_client(FakeResponse(), version=2)
                 with self.assertRaises(ValueError):
                     await getattr(nas, method_name)()
                 self.assertEqual(nas.session.calls, [])
+
+    async def test_reboot_runs_safety_check_then_action(self):
+        nas = self.make_power_client(
+            [FakeResponse(text="<config><res>0</res></config>"), FakeResponse()]
+        )
+        await nas.reboot()
+        self.assertEqual(
+            [call[2]["data"] for call in nas.session.calls],
+            ["cmd=cgi_Detect_Dangerous", "cmd=cgi_restart"],
+        )
+
+    async def test_shutdown_runs_safety_check_then_action(self):
+        nas = self.make_power_client(
+            [FakeResponse(text="<config><res>0</res></config>"), FakeResponse()]
+        )
+        await nas.shutdown()
+        self.assertEqual(nas.session.calls[1][2]["data"], "cmd=cgi_shutdown")
+
+    async def test_power_action_is_blocked_before_action_request(self):
+        nas = self.make_power_client(FakeResponse(text="<config><res>2</res></config>"))
+        with self.assertRaises(PowerActionBlockedError):
+            await nas.reboot()
+        self.assertEqual(len(nas.session.calls), 1)
+
+    async def test_power_action_accepts_only_server_disconnect(self):
+        class DisconnectResponse:
+            async def __aenter__(self):
+                raise aiohttp.ServerDisconnectedError()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        nas = self.make_power_client(
+            [
+                FakeResponse(text="<config><res>0</res></config>"),
+                DisconnectResponse(),
+            ]
+        )
+        await nas.reboot()
+
+        nas = self.make_power_client(
+            [
+                FakeResponse(text="<config><res>0</res></config>"),
+                FakeResponse(status=503),
+            ]
+        )
+        with self.assertRaises(RequestFailedError):
+            await nas.reboot()
+
+    async def test_power_actions_are_os5_only(self):
+        for method_name in ("reboot", "shutdown"):
+            with self.subTest(method=method_name):
+                nas = self.make_client(FakeResponse(), version=2)
+                with self.assertRaises(ValueError):
+                    await getattr(nas, method_name)()
+                self.assertEqual(nas.session.calls, [])
+
+    async def test_power_action_rejects_unexpected_safety_responses(self):
+        for xml in (
+            "<config/>",
+            "<config><res>busy</res></config>",
+            "<invalid",
+        ):
+            with self.subTest(xml=xml):
+                nas = self.make_power_client(FakeResponse(text=xml))
+                with self.assertRaises((TypeError, ElementTree.ParseError)):
+                    await nas.reboot()
+                self.assertEqual(len(nas.session.calls), 1)
+
+    async def test_power_action_timeout_never_sends_action(self):
+        class SlowSafetyResponse:
+            async def __aenter__(self):
+                await asyncio.Event().wait()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        nas = self.make_power_client(SlowSafetyResponse())
+        with (
+            patch("wdnas_client.POWER_ACTION_TIMEOUT", 0.01),
+            self.assertRaises(TimeoutError),
+        ):
+            await nas.reboot()
+        self.assertEqual(len(nas.session.calls), 1)
+
+    async def test_power_action_requires_authentication(self):
+        nas = self.make_client(FakeResponse(text="<config><res>0</res></config>"))
+        with self.assertRaises(InvalidLoginError):
+            await nas.reboot()
+        self.assertEqual(nas.session.calls, [])
+
+    async def test_power_safety_http_error_never_sends_action(self):
+        nas = self.make_power_client(FakeResponse(status=401))
+        with self.assertRaises(RequestFailedError) as caught:
+            await nas.shutdown()
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertEqual(len(nas.session.calls), 1)
 
 
 if __name__ == "__main__":

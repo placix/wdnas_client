@@ -35,3 +35,8 @@ injection. The device returned HTTP 500 with an empty body for `uptime()` and
 HTTP 404 for the state-dependent `/xml/dm_read_state.xml` resource. Compatibility
 of the new monitoring methods is asserted only for Mirror firmware 5.33.102;
 other listed OS 5 models retain their existing support status.
+
+The Mirror dashboard source for firmware 5.33.102 confirms the safety-check,
+restart, and shutdown CGI commands implemented by `reboot()` and `shutdown()`.
+Only automated response fixtures were used for these destructive actions; they
+were deliberately not executed against the physical NAS.

@@ -39,8 +39,21 @@ This document outlines the API endpoints for the WD NAS systems supported by thi
 | Internet Access | `GET` | `/cgi-bin/network_mgr.cgi?cmd=cgi_get_internet_access` | *None* | Connectivity assessment made by the NAS |
 | Process Info | `POST` | `/cgi-bin/status_mgr.cgi` | `cmd=cgi_process` | Diagnostic process list |
 | Uptime | `POST` | `/cgi-bin/status_mgr.cgi` | `cmd=cgi_get_uptime` | Not available on all OS 5 models |
+| Power safety check | `POST` | `/cgi-bin/hd_config.cgi` | `cmd=cgi_Detect_Dangerous` | Required before restart/shutdown; non-zero blocks the action |
+| Restart | `POST` | `/cgi-bin/system_mgr.cgi` | `cmd=cgi_restart` | Authenticated OS 5 action; may disconnect HTTP immediately |
+| Shutdown | `POST` | `/cgi-bin/system_mgr.cgi` | `cmd=cgi_shutdown` | Authenticated OS 5 action; may disconnect HTTP immediately |
 
 ## Method responses and compatibility
+
+### `await nas.reboot()` / `await nas.shutdown()`
+
+OS 5 only. Both methods first call the dashboard's read-only
+`cgi_Detect_Dangerous` check. A non-zero result raises
+`PowerActionBlockedError` and the action request is not sent. Only a specific
+`aiohttp.ServerDisconnectedError` after the action request is treated as the
+expected device transition; timeouts, HTTP failures, malformed safety replies,
+and other exceptions remain errors. These methods use the existing authenticated
+session and do not use SSH.
 
 ### `await nas.diagnostics()`
 

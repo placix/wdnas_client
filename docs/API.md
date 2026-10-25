@@ -22,6 +22,7 @@ This document outlines the API endpoints for the WD NAS systems supported by thi
 | Function | HTTP Method | Endpoint | Parameters / Body | Notes |
 | --- | --- | --- | --- | --- |
 | Login | `POST` | `/nas/v1/auth` | `{"username":"user1","password":"alisdh2309oas"}` | `application/json` body |
+| Logout | `DELETE` | `/nas/v1/auth` | *None* | Uses the current authenticated session cookies |
 | System Info | `GET` | `/xml/sysinfo.xml` | *None* | |
 | Share Names | `POST` | `/web/get_share_name_list.php` | *None* | |
 | System Status | `POST` | `/cgi-bin/status_mgr.cgi` | `cmd=resource` | `application/x-www-form-urlencoded` body |
@@ -44,6 +45,21 @@ This document outlines the API endpoints for the WD NAS systems supported by thi
 | Shutdown | `POST` | `/cgi-bin/system_mgr.cgi` | `cmd=cgi_shutdown` | Authenticated OS 5 action; may disconnect HTTP immediately |
 
 ## Method responses and compatibility
+
+### `await nas.logout()` / `await nas.close()`
+
+For OS 5, `logout()` sends the same authenticated `DELETE /nas/v1/auth`
+request used by the WD web interface. It does not create a session and is safe
+to call repeatedly. `close()` first attempts that server-side logout and always
+closes the local `aiohttp.ClientSession`; a logout HTTP, timeout, or transport
+failure remains visible to the caller. Context-manager cleanup preserves an
+exception already being handled instead of replacing it with a secondary
+logout failure.
+
+No equivalent OS 2 server endpoint has been established from the available WD
+sources. OS 2 `close()` therefore closes only the local HTTP session, while an
+explicit OS 2 `logout()` raises `ValueError` rather than claiming that the NAS
+session was released.
 
 ### `await nas.reboot()` / `await nas.shutdown()`
 

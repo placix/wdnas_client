@@ -54,6 +54,7 @@ class FakeSession:
         self.response = response
         self.calls = []
         self.cookie_jar = CookieJar()
+        self.closed = False
 
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
@@ -62,6 +63,13 @@ class FakeSession:
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
         return self.response
+
+    def delete(self, url, **kwargs):
+        self.calls.append(("DELETE", url, kwargs))
+        return self.responses.pop(0) if self.responses is not None else self.response
+
+    async def close(self):
+        self.closed = True
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
@@ -109,6 +117,158 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             (method, url), ("POST", "http://nas.local/cgi-bin/login_mgr.cgi")
         )
         self.assertIn("cmd=wd_login", kwargs["data"])
+
+    async def test_os5_logout_uses_proven_endpoint_and_existing_session(self):
+        nas = self.make_power_client(FakeResponse(status=204))
+
+        await nas.logout()
+
+        self.assertEqual(
+            nas.session.calls,
+            [
+                (
+                    "DELETE",
+                    "http://nas.local/nas/v1/auth",
+                    {"headers": {"Accept": "application/json", "Host": "nas.local"}},
+                )
+            ],
+        )
+        self.assertIsNone(nas.phpsessid)
+        self.assertFalse(nas.session.closed)
+
+    async def test_close_logs_out_then_closes_local_session(self):
+        nas = self.make_power_client(FakeResponse())
+
+        await nas.close()
+
+        self.assertEqual(nas.session.calls[0][0], "DELETE")
+        self.assertTrue(nas.session.closed)
+        self.assertIsNone(nas.phpsessid)
+
+    async def test_close_is_idempotent_and_concurrent_safe(self):
+        nas = self.make_power_client(FakeResponse())
+
+        await asyncio.gather(nas.close(), nas.close(), nas.close())
+        await nas.close()
+
+        self.assertEqual(
+            [call[0] for call in nas.session.calls].count("DELETE"),
+            1,
+        )
+
+    async def test_close_reports_logout_http_error_after_local_cleanup(self):
+        nas = self.make_power_client(FakeResponse(status=503))
+
+        with self.assertRaises(RequestFailedError) as caught:
+            await nas.close()
+
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertTrue(nas.session.closed)
+        with self.assertRaises(RequestFailedError):
+            await nas.close()
+        self.assertEqual(len(nas.session.calls), 1)
+
+    async def test_context_exit_does_not_mask_original_exception(self):
+        nas = self.make_power_client(FakeResponse(status=503))
+
+        original = RuntimeError("original failure")
+        with self.assertRaises(RuntimeError) as caught:
+            try:
+                raise original
+            except RuntimeError:
+                await nas.__aexit__(RuntimeError, original, original.__traceback__)
+                raise
+
+        self.assertIs(caught.exception, original)
+        self.assertTrue(nas.session.closed)
+
+    async def test_os2_close_remains_local_and_does_not_call_logout_endpoint(self):
+        nas = self.make_client(FakeResponse(), version=2)
+        nas.phpsessid = "session-id"
+        nas.wd_csrf_token = "csrf-token"
+
+        await nas.close()
+
+        self.assertEqual(nas.session.calls, [])
+        self.assertTrue(nas.session.closed)
+
+        with self.assertRaises(ValueError):
+            await nas.logout()
+
+    async def test_failed_context_login_closes_local_session(self):
+        nas = client("Admin", "secret", "nas.local", 5)
+        session = FakeSession(FakeResponse(status=401))
+
+        with (
+            patch("wdnas_client.aiohttp.ClientSession", return_value=session),
+            self.assertRaises(RequestFailedError),
+        ):
+            await nas.__aenter__()
+
+        self.assertTrue(session.closed)
+        self.assertIsNone(nas.phpsessid)
+
+    async def test_failed_login_cleanup_does_not_mask_login_error(self):
+        class FailingCloseSession(FakeSession):
+            async def close(self):
+                self.closed = True
+                raise RuntimeError("local cleanup failed")
+
+        nas = client("Admin", "secret", "nas.local", 5)
+        session = FailingCloseSession(FakeResponse(status=401))
+
+        with (
+            patch("wdnas_client.aiohttp.ClientSession", return_value=session),
+            self.assertRaises(RequestFailedError) as caught,
+        ):
+            await nas.__aenter__()
+
+        self.assertEqual(caught.exception.status_code, 401)
+        self.assertTrue(session.closed)
+
+    async def test_logout_timeout_closes_locally_and_is_not_reported_as_success(self):
+        class SlowDeleteResponse:
+            async def __aenter__(self):
+                await asyncio.Event().wait()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        nas = self.make_power_client(SlowDeleteResponse())
+
+        with (
+            patch("wdnas_client.SESSION_ACTION_TIMEOUT", 0.01),
+            self.assertRaises(TimeoutError),
+        ):
+            await nas.close()
+
+        self.assertTrue(nas.session.closed)
+
+    async def test_logout_disconnect_and_invalid_session_are_errors(self):
+        class DisconnectResponse:
+            async def __aenter__(self):
+                raise aiohttp.ServerDisconnectedError()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        disconnected = self.make_power_client(DisconnectResponse())
+        with self.assertRaises(aiohttp.ServerDisconnectedError):
+            await disconnected.close()
+        self.assertTrue(disconnected.session.closed)
+
+        invalid = self.make_power_client(FakeResponse(status=403))
+        with self.assertRaises(RequestFailedError) as caught:
+            await invalid.close()
+        self.assertEqual(caught.exception.status_code, 403)
+        self.assertTrue(invalid.session.closed)
+
+    async def test_logout_without_authenticated_session_does_not_log_in(self):
+        nas = self.make_client(FakeResponse())
+
+        await nas.logout()
+
+        self.assertEqual(nas.session.calls, [])
 
     async def test_diagnostics_healthy_raid1(self):
         xml = """<config>

@@ -8,7 +8,13 @@ from xml.etree import ElementTree
 
 import aiohttp
 
-from .const import ENDPOINTS, POWER_ACTION_TIMEOUT, SCHEME, V2_RAW_LOGIN_STRING
+from .const import (
+    ENDPOINTS,
+    POWER_ACTION_TIMEOUT,
+    SCHEME,
+    SESSION_ACTION_TIMEOUT,
+    V2_RAW_LOGIN_STRING,
+)
 from .exceptions import (
     InvalidLoginError,
     PowerActionBlockedError,
@@ -92,14 +98,106 @@ class client:
         self.session = None
         self.phpsessid = None
         self.wd_csrf_token = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._logout_attempted = False
+        self._logout_error = None
     
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        await self.login()
-        return self
+        async with self._lifecycle_lock:
+            if (
+                self.session is not None
+                and not getattr(self.session, "closed", False)
+                and self.phpsessid
+            ):
+                return self
+
+            if self.session is not None and not getattr(self.session, "closed", False):
+                await self.session.close()
+
+            self.session = aiohttp.ClientSession()
+            self.phpsessid = None
+            self.wd_csrf_token = None
+            self._logout_attempted = False
+            self._logout_error = None
+            try:
+                await self.login()
+            except BaseException:
+                try:
+                    await self.session.close()
+                except BaseException:  # noqa: BLE001, S110 - preserve login failure
+                    pass
+                self.phpsessid = None
+                self.wd_csrf_token = None
+                raise
+            return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.session.close()
+        try:
+            await self.close()
+        except Exception:
+            if exc_type is None:
+                raise
+
+    async def logout(self) -> None:
+        """End the authenticated OS 5 session without opening a new session.
+
+        WD OS 5's own web interface sends ``DELETE /nas/v1/auth`` with the
+        current session cookies. No equivalent OS 2 endpoint is established,
+        so OS 2 cleanup remains local for backward compatibility.
+        """
+        if self.version != 5:
+            raise ValueError(
+                "Server-side logout is only established for API version 5"
+            )
+        async with self._lifecycle_lock:
+            await self._logout_unlocked()
+
+    async def _logout_unlocked(self) -> None:
+        """Perform at most one server-side logout attempt."""
+        if self._logout_attempted:
+            if self._logout_error is not None:
+                raise self._logout_error
+            return
+
+        if self.session is None or not self.phpsessid:
+            return
+        if getattr(self.session, "closed", False):
+            return
+
+        self._logout_attempted = True
+        url = f"{SCHEME}{self.host}{ENDPOINTS[5]['logout']}"
+        headers = {"Accept": "application/json", "Host": self.host}
+        try:
+            async with asyncio.timeout(SESSION_ACTION_TIMEOUT):
+                async with self.session.delete(url, headers=headers) as response:
+                    if not 200 <= response.status < 300:
+                        raise RequestFailedError(response.status)
+        except BaseException as error:
+            self._logout_error = error
+            raise
+        else:
+            self.phpsessid = None
+            self.wd_csrf_token = None
+
+    async def close(self) -> None:
+        """End the NAS session when supported, then close local HTTP resources."""
+        async with self._lifecycle_lock:
+            logout_error = None
+            try:
+                if self.version == 5:
+                    await self._logout_unlocked()
+            except BaseException as error:  # noqa: BLE001 - preserve cancellation
+                logout_error = error
+            finally:
+                if self.session is not None and not getattr(
+                    self.session, "closed", False
+                ):
+                    await self.session.close()
+                self.phpsessid = None
+                self.wd_csrf_token = None
+
+            if logout_error is not None:
+                raise logout_error
         
     async def login(self) -> None:
         """Login to device"""

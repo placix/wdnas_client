@@ -1,6 +1,23 @@
-
 class InvalidLoginError(Exception):
-    pass
+    """Authentication failed, optionally with a safe HTTP status code."""
+
+    def __init__(self, message="Authentication failed", status_code=None):
+        self.status_code = status_code
+        super().__init__(message)
+
+
+class SessionEstablishmentError(Exception):
+    """The NAS accepted login but did not establish a usable client session."""
+
+    def __init__(self, cleanup_error=None):
+        self.cleanup_error = cleanup_error
+        detail = (
+            " and server-side cleanup did not complete"
+            if cleanup_error is not None
+            else ""
+        )
+        super().__init__(f"NAS session establishment failed{detail}")
+
 
 class RequestFailedError(Exception):
     def __init__(self, status_code):

@@ -40,3 +40,25 @@ The Mirror dashboard source for firmware 5.33.102 confirms the safety-check,
 restart, and shutdown CGI commands implemented by `reboot()` and `shutdown()`.
 Only automated response fixtures were used for these destructive actions; they
 were deliberately not executed against the physical NAS.
+
+## Version 4 Systems (V4 identifier)
+
+V4 is this integration's identifier for original WD My Cloud devices in the OS
+3 family; it is not a claim that WD released a product named My Cloud OS 4.
+
+| Model | Model number | Firmware | Support status | Validation |
+| --- | --- | --- | --- | --- |
+| WD My Cloud | `sq` | `04.06.00-111` | Provisional | Read endpoints manually verified in an authenticated browser; programmatic login and all parsing covered by offline mocks; independent hardware login still pending |
+
+The verified browser endpoints are `/api/2.1/rest/system_information`,
+`/api/2.1/rest/firmware_info`, and `/api/2.1/rest/system_state`. The first
+provides identity and the `2TB` capacity label; the other resources provide
+firmware package data and qualitative health strings. No CPU, memory, used/free
+byte counters, numeric temperature, detailed disk list, or detailed volume list
+has been established, so the client does not fabricate them.
+
+The login endpoint is `/api/2.1/rest/local_login` with username and password
+query parameters. It is implemented and mock-tested, but physical-device
+authentication remains to be validated. HTTP does not encrypt these query
+parameters. No V4 server-side logout or power endpoint is enabled without the
+missing original JavaScript evidence.

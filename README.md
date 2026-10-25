@@ -9,7 +9,8 @@ Initially built for my Home Assistant integration [ha-mycloud](https://github.co
 ## Features
 * Fetches system info, share names, network status, and more.
 * Asynchronous library using `asyncio` and `client`.
-* Supports V2 and V5 WD NAS firmware.
+* Supports V2 and V5 WD NAS firmware and provisional V4 support for original
+  WD My Cloud OS 3 devices using the REST 2.1 XML API.
 * Reports OS 5 RAID diagnostics, detailed volume state, resource monitoring,
   process diagnostics, warning state, and NAS-reported internet connectivity.
 
@@ -39,18 +40,27 @@ async def main():
     username = input("Username: ").lower()
     password = getpass.getpass("Password: ")
     host = '192.168.1.42'
-    version = 2 # Can be 2 or 5
+    version = 2 # Can be 2, 4 or 5
     
     async with client(username, password, host, version) as wdNAS:
-        # V2 and V5 systems
+        # V2, V4 and V5 systems
         print("System Info:", await wdNAS.system_info())
-        print("Share Names:", await wdNAS.share_names())
         print("System Status:", await wdNAS.system_status())
-        print("Network Info:", await wdNAS.network_info())
         print("Device Info:", await wdNAS.device_info())
         print("System Version:", await wdNAS.system_version())
-        print("Accounts:", await wdNAS.accounts())
-        print("Alerts:", await wdNAS.alerts())
+
+        # V2 and V5 systems
+        if version in (2, 5):
+            print("Share Names:", await wdNAS.share_names())
+            print("Network Info:", await wdNAS.network_info())
+            print("Accounts:", await wdNAS.accounts())
+            print("Alerts:", await wdNAS.alerts())
+
+        # V4 systems only
+        if version == 4:
+            print("System Information:", await wdNAS.system_information())
+            print("Firmware Info:", await wdNAS.firmware_info())
+            print("System State:", await wdNAS.system_state())
 
         # V2 systems only
         if version == 2:
@@ -107,3 +117,14 @@ NAS returns
 error. The tested firmware returns HTTP 500 for the uptime endpoint, so callers
 should catch `UptimeUnavailableError` (which remains a subclass of
 `RequestFailedError`). See the API reference for response shapes and limits.
+
+## Original WD My Cloud V4 (OS 3 family)
+
+Model number `sq` with firmware `04.06.00-111` is a validation target. The
+device's authenticated browser session has manually confirmed the REST 2.1 XML
+resources `system_information`, `firmware_info`, and `system_state`. The client
+login and parsers are covered by offline response fixtures, but programmatic
+authentication has not yet been validated against the physical NAS. V4 login
+uses unencrypted HTTP query parameters, so it must be limited to a trusted local
+network. V4 power actions are not enabled because their original JavaScript was
+not available for verification.

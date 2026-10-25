@@ -1,8 +1,18 @@
-V2_RAW_LOGIN_STRING = 'cmd=wd_login&username={username}&pwd={enc_password}'
+V2_RAW_LOGIN_STRING = "cmd=wd_login&username={username}&pwd={enc_password}"
 
 SCHEME = "http://"
 POWER_ACTION_TIMEOUT = 15
 SESSION_ACTION_TIMEOUT = 15
+
+V4_ENDPOINTS = {
+    "login": "/api/2.1/rest/local_login",
+    "logout": "/api/2.1/rest/logout",
+    "system_information": "/api/2.1/rest/system_information",
+    "firmware_info": "/api/2.1/rest/firmware_info",
+    "system_state": "/api/2.1/rest/system_state",
+    "storage_usage": "/api/2.1/rest/storage_usage",
+    "internet_access": "/api/2.1/rest/internet_access",
+}
 
 ENDPOINTS = {
     2: {
@@ -37,5 +47,5 @@ ENDPOINTS = {
         "process_info": "/cgi-bin/status_mgr.cgi",
         "power_safety": "/cgi-bin/hd_config.cgi",
         "power_action": "/cgi-bin/system_mgr.cgi",
-    }
+    },
 }

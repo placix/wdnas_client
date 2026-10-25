@@ -17,6 +17,36 @@ This document outlines the API endpoints for the WD NAS systems supported by thi
 | Accounts | `POST` | `/xml/account.xml` | *None* | |
 | Alerts | `POST` | `/cgi-bin/system_mgr.cgi` | `cmd=cgi_get_alert` | `application/x-www-form-urlencoded` body |
 
+## Version 4 Systems (V4 integration identifier)
+
+These original WD My Cloud devices belong to the OS 3 family. V4 identifies
+their REST 2.1 XML API inside this project.
+
+| Function | HTTP Method | Endpoint | Parameters | Notes |
+| --- | --- | --- | --- | --- |
+| Login | `GET` | `/api/2.1/rest/local_login` | `username`, `password` query parameters | Implemented from firmware-interface evidence; physical client login validation pending |
+| System Information | `GET` | `/api/2.1/rest/system_information` | *None* | Identity and capacity label |
+| Firmware Info | `GET` | `/api/2.1/rest/firmware_info` | *None* | Current package name, version, and description |
+| System State | `GET` | `/api/2.1/rest/system_state` | *None* | Qualitative readiness and health strings |
+
+`system_information()`, `firmware_info()`, and `system_state()` expose the
+verified XML resources directly. The established `system_info()`,
+`device_info()`, `system_version()`, and `system_status()` methods adapt those
+responses for existing consumers. A capacity label such as `2TB` is converted
+to decimal bytes; unknown formats remain `None`. Used/free storage, CPU, memory,
+numeric temperature, disk topology, and volume topology remain unavailable.
+
+V4 login maintains cookies in the existing `aiohttp.ClientSession`. HTTP 401
+and 403 responses become `InvalidLoginError`, including expired-session reads.
+The client sanitizes login transport exceptions because the firmware sends the
+credentials in URL query parameters. Plain HTTP provides no confidentiality;
+use only on a trusted local network and avoid HTTP request logging.
+
+No V4 server-side logout endpoint has been established. Closing V4 therefore
+releases the local HTTP session only. Restart and shutdown are not implemented:
+the candidate `PUT /api/2.1/rest/shutdown` request could not be checked against
+the original JavaScript available in this workspace.
+
 ## Version 5 Systems (V5)
 
 | Function | HTTP Method | Endpoint | Parameters / Body | Notes |

@@ -5,8 +5,8 @@ Target represented by the captured assets: WD My Cloud Mirror Gen 2 / OS 5.33.10
 
 ## Scope and evidence levels
 
-This report is a static analysis of every `*.js` file below
-`C:\Users\pLaCiX\Projects\WD-Mirror\resources`. No request was sent to the NAS.
+This report is a static analysis of the captured `WD-Mirror/resources` JavaScript
+files. No request was sent to the NAS.
 The terms used below have deliberately narrow meanings:
 
 - **JS-proven**: endpoint, method, parameters, and consumed fields occur in the

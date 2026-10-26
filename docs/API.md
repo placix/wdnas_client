@@ -56,6 +56,7 @@ session and issue exactly one `PUT` request without retry or method fallback.
 | Function | HTTP Method | Endpoint | Parameters / Body | Notes |
 | --- | --- | --- | --- | --- |
 | Login | `POST` | `/nas/v1/auth` | `{"username":"user1","password":"alisdh2309oas"}` | `application/json` body |
+| Logout | `DELETE` | `/nas/v1/auth` | *None* | Reuses the existing authenticated session; never retried |
 | System Info | `GET` | `/xml/sysinfo.xml` | *None* | |
 | Share Names | `POST` | `/web/get_share_name_list.php` | *None* | |
 | System Status | `POST` | `/cgi-bin/status_mgr.cgi` | `cmd=resource` | `application/x-www-form-urlencoded` body |
@@ -86,8 +87,16 @@ request using the existing session. `close()` makes at most one logout attempt
 and always closes the local `aiohttp.ClientSession`; a logout HTTP, timeout, or
 transport failure remains visible to the caller.
 
-The protected historical OS 5 path closes its local HTTP session without
-introducing the later experimental logout/session-manager behavior.
+For OS 5, `logout()` sends the WD JavaScript-confirmed
+`DELETE /nas/v1/auth` request through the existing HTTP session. It does not
+require the legacy `phpsessid` attribute and never creates a session or logs in.
+Concurrent or repeated cleanup sends at most one request. `close()` always
+closes local resources and still reports HTTP, timeout, or connection failures.
+For safety, an open HTTP session alone is not treated as ownership. The DELETE
+is permitted only after the login response issued a `PHPSESSID` or a protected
+OS 5 system/device response was successfully parsed. Ambiguous login cleanup is
+local-only. Server-side invalidation on config-entry disable was successfully
+tested on a My Cloud Mirror Gen 2 running firmware 5.33.102.
 
 No equivalent OS 2 server endpoint has been established from the available WD
 sources. OS 2 `close()` therefore closes only the local HTTP session, while an

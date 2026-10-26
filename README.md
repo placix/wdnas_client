@@ -127,6 +127,14 @@ should catch `UptimeUnavailableError` (which remains a subclass of
 `RequestFailedError`). See the API reference for response shapes and limits.
 Restart was successfully exercised on the physical Mirror. Shutdown uses the
 same WD JavaScript-derived safety flow but has not been executed on hardware.
+Cleanup uses the WD JavaScript-confirmed `DELETE /nas/v1/auth` endpoint before
+closing local HTTP resources. Releasing the administrator session when the
+Home Assistant config entry is disabled was successfully tested on the Mirror
+Gen 2 with firmware 5.33.102.
+The client sends that request only after the current login issued a session
+cookie or a protected OS 5 response was successfully parsed. A failed or
+ambiguous login therefore closes local resources without risking another
+administrator's browser session.
 
 ## Original WD My Cloud V4 (OS 3 family)
 

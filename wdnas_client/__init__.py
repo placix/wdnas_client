@@ -2,6 +2,7 @@ import asyncio
 import base64
 import http.cookies
 import json
+import logging
 import re
 from datetime import timedelta
 from xml.etree import ElementTree
@@ -21,10 +22,12 @@ from .exceptions import (
     InvalidLoginError,
     PowerActionBlockedError,
     RequestFailedError,
-    SessionEstablishmentError,
     UptimeUnavailableError,
 )
 from .v4 import V4Adapter
+
+_LOGGER = logging.getLogger(__name__)
+POWER_GUARD_REVISION = "os5-power-open-session-v3"
 
 
 def _optional_int(value):
@@ -111,6 +114,14 @@ class client:
         self._v4 = V4Adapter(self)
 
     async def __aenter__(self):
+        # Protected historical OS 5 path from client commit 4e6389f.  In
+        # particular, keep aiohttp's default CookieJar and do not involve the
+        # newer lifecycle/logout manager used by V4.
+        if self.version == 5:
+            self.session = aiohttp.ClientSession()
+            await self.login()
+            return self
+
         async with self._lifecycle_lock:
             if (
                 self.session is not None
@@ -149,6 +160,10 @@ class client:
             return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.version == 5:
+            await self.session.close()
+            return
+
         try:
             await self.close()
         except Exception:
@@ -156,22 +171,14 @@ class client:
                 raise
 
     async def logout(self) -> None:
-        """End an authenticated OS 4 or OS 5 session without opening a new one.
-
-        WD OS 5's own web interface sends ``DELETE /nas/v1/auth`` with the
-        current session cookies. WD OS 4 uses ``GET /api/2.1/rest/logout``.
-        No equivalent OS 2 endpoint is established, so OS 2 cleanup remains
-        local for backward compatibility.
-        """
-        if self.version not in (4, 5):
-            raise ValueError(
-                "Server-side logout is only established for API versions 4 and 5"
-            )
+        """End an authenticated V4 session without opening a new one."""
+        if self.version != 4:
+            raise ValueError("Server-side logout is only enabled for API version 4")
         async with self._lifecycle_lock:
             await self._logout_unlocked()
 
-    async def _logout_unlocked(self, *, force_os5_cleanup: bool = False) -> None:
-        """Perform at most one server-side logout attempt."""
+    async def _logout_unlocked(self) -> None:
+        """Perform at most one V4 server-side logout attempt."""
         if self._logout_attempted:
             if self._logout_error is not None:
                 raise self._logout_error
@@ -181,20 +188,13 @@ class client:
             return
         if getattr(self.session, "closed", False):
             return
-        if self.version == 5 and not self.phpsessid and not force_os5_cleanup:
-            return
-        if self.version == 4 and not self._authenticated:
+        if not self._authenticated:
             return
 
         self._logout_attempted = True
-        if self.version == 4:
-            url = f"{SCHEME}{self.host}{V4_ENDPOINTS['logout']}"
-            request = self.session.get
-            headers = {"Accept": "application/xml", "Host": self.host}
-        else:
-            url = f"{SCHEME}{self.host}{ENDPOINTS[5]['logout']}"
-            request = self.session.delete
-            headers = {"Accept": "application/json", "Host": self.host}
+        url = f"{SCHEME}{self.host}{V4_ENDPOINTS['logout']}"
+        request = self.session.get
+        headers = {"Accept": "application/xml", "Host": self.host}
         try:
             async with asyncio.timeout(SESSION_ACTION_TIMEOUT):
                 async with request(url, headers=headers) as response:
@@ -210,10 +210,15 @@ class client:
 
     async def close(self) -> None:
         """End the NAS session when supported, then close local HTTP resources."""
+        if self.version == 5:
+            if self.session is not None and not getattr(self.session, "closed", False):
+                await self.session.close()
+            return
+
         async with self._lifecycle_lock:
             logout_error = None
             try:
-                if self.version in (4, 5):
+                if self.version == 4:
                     await self._logout_unlocked()
             except BaseException as error:  # noqa: BLE001 - preserve cancellation
                 logout_error = error
@@ -237,127 +242,121 @@ class client:
             self._authenticated = True
             return
 
-        url = f"{SCHEME}{self.host}{ENDPOINTS[self.version]['login']}"
-        login_url = URL(url)
-        pre_login_session = None
         if self.version == 5:
-            pre_login_session = self.session.cookie_jar.filter_cookies(login_url).get(
-                "PHPSESSID"
-            )
+            await self._login_os5()
+            return
 
+        url = f"{SCHEME}{self.host}{ENDPOINTS[self.version]['login']}"
         enc_password = base64.b64encode(self.password.encode("utf-8")).decode("utf-8")
 
-        if self.version == 2:
-            data = V2_RAW_LOGIN_STRING.format(
-                username=self.username, enc_password=enc_password
-            )
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Host": self.host,
-            }
-            async with self.session.post(url, data=data, headers=headers) as response:
-                pass
-        elif self.version == 5:
-            json_payload = {"username": self.username, "password": enc_password}
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "Host": self.host,
-            }
-            async with self.session.post(
-                url, json=json_payload, headers=headers
-            ) as response:
-                pass
+        data = V2_RAW_LOGIN_STRING.format(
+            username=self.username, enc_password=enc_password
+        )
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Host": self.host,
+        }
+        async with self.session.post(url, data=data, headers=headers) as response:
+            pass
 
         if response.status == 200:
-            parsed_response_cookies = http.cookies.SimpleCookie()
+            cookies = response.cookies
+            if "PHPSESSID" in cookies and "WD-CSRF-TOKEN" in cookies:
+                self.phpsessid = cookies["PHPSESSID"].value
+                self.wd_csrf_token = cookies["WD-CSRF-TOKEN"].value
+            else:
+                raise InvalidLoginError("Invalid Username/Password or missing cookies")
+            self._authenticated = True
+        else:
+            raise RequestFailedError(response.status)
+
+    async def _login_os5(self) -> None:
+        """Authenticate using the protected historical OS 5 implementation."""
+        url = f"{SCHEME}{self.host}{ENDPOINTS[5]['login']}"
+        enc_password = base64.b64encode(self.password.encode("utf-8")).decode("utf-8")
+        json_payload = {"username": self.username, "password": enc_password}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Host": self.host,
+        }
+        async with self.session.post(
+            url, json=json_payload, headers=headers
+        ) as response:
+            pass
+
+        if response.status == 200:
             set_cookies = response.headers.getall("Set-Cookie", [])
             for cookie_str in set_cookies:
                 cookie = http.cookies.SimpleCookie(cookie_str)
-                parsed_response_cookies.update(cookie)
-                self.session.cookie_jar.update_cookies(cookie, response_url=login_url)
+                for key, morsel in cookie.items():
+                    self.session.cookie_jar.update_cookies({key: morsel.value})
 
             cookies = response.cookies
-
-            if self.version == 2:
-                if "PHPSESSID" in cookies and "WD-CSRF-TOKEN" in cookies:
-                    self.phpsessid = cookies["PHPSESSID"].value
-                    self.wd_csrf_token = cookies["WD-CSRF-TOKEN"].value
-                else:
-                    raise InvalidLoginError(
-                        "Invalid Username/Password or missing cookies"
-                    )
-            elif self.version == 5:
-                session_cookie = cookies.get("PHPSESSID")
-                if session_cookie is None:
-                    session_cookie = parsed_response_cookies.get("PHPSESSID")
-                if session_cookie is None:
-                    jar_cookie = self.session.cookie_jar.filter_cookies(login_url).get(
-                        "PHPSESSID"
-                    )
-                    if jar_cookie is not None and (
-                        pre_login_session is None
-                        or jar_cookie.value != pre_login_session.value
-                    ):
-                        session_cookie = jar_cookie
-
-                if session_cookie is None or not session_cookie.value:
-                    cleanup_error = None
-                    current_response_has_cookies = bool(
-                        set_cookies or list(cookies.values())
-                    )
-                    if current_response_has_cookies and pre_login_session is None:
-                        try:
-                            await self._logout_unlocked(force_os5_cleanup=True)
-                        except BaseException as error:  # noqa: BLE001
-                            cleanup_error = error
-                    raise SessionEstablishmentError(cleanup_error)
-
-                self.phpsessid = session_cookie.value
-                self.session.cookie_jar.update_cookies(
-                    {"PHPSESSID": self.phpsessid},
-                    response_url=URL(f"{SCHEME}{self.host}/"),
-                )
-            self._authenticated = True
+            if "PHPSESSID" in cookies:
+                self.phpsessid = cookies["PHPSESSID"].value
         else:
-            if self.version == 5 and response.status in (401, 403):
-                raise InvalidLoginError(
-                    "The NAS rejected the credentials", response.status
-                )
             raise RequestFailedError(response.status)
 
     async def _power_action(self, command: str) -> None:
         """Run a JavaScript-proven OS 5 power command after its safety check."""
         if self.version != 5:
             raise ValueError("Unsupported/invalid version. Must be 5.")
-        if (
-            self.session is None
-            or getattr(self.session, "closed", False)
-            or not self.phpsessid
-        ):
+
+        safety_url = f"{SCHEME}{self.host}{ENDPOINTS[5]['power_safety']}"
+        action_url = f"{SCHEME}{self.host}{ENDPOINTS[5]['power_action']}"
+        session_present = self.session is not None
+        session_closed = (
+            getattr(self.session, "closed", False) if session_present else False
+        )
+        if not session_present or session_closed:
+            _LOGGER.warning(
+                "OS 5 power diagnostic: api_version=%s session_present=%s "
+                "session_closed=%s phpsessid_present=%s "
+                "preflight_started=False phase=session_guard "
+                "exception_type=InvalidLoginError",
+                self.version,
+                session_present,
+                session_closed,
+                bool(self.phpsessid),
+            )
             raise InvalidLoginError("An authenticated NAS session is required")
 
         headers = {
             "Host": self.host,
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         }
-        safety_url = f"{SCHEME}{self.host}{ENDPOINTS[5]['power_safety']}"
-        action_url = f"{SCHEME}{self.host}{ENDPOINTS[5]['power_action']}"
+        _LOGGER.debug(
+            "OS 5 power diagnostic: api_version=%s session_present=True "
+            "session_closed=False phpsessid_present=%s "
+            "preflight_started=True phase=preflight",
+            self.version,
+            bool(self.phpsessid),
+        )
 
         async with asyncio.timeout(POWER_ACTION_TIMEOUT):
-            async with self.session.post(
-                safety_url, data="cmd=cgi_Detect_Dangerous", headers=headers
-            ) as response:
-                if response.status != 200:
-                    raise RequestFailedError(response.status)
-                root = ElementTree.fromstring(await response.text())
-                result = _optional_int(root.findtext(".//res"))
-                if not isinstance(result, int):
-                    raise TypeError(
-                        "Power safety response did not contain a numeric res"
-                    )
-                if result != 0:
-                    raise PowerActionBlockedError(result)
+            try:
+                async with self.session.post(
+                    safety_url, data="cmd=cgi_Detect_Dangerous", headers=headers
+                ) as response:
+                    if response.status != 200:
+                        raise RequestFailedError(response.status)
+                    root = ElementTree.fromstring(await response.text())
+                    result = _optional_int(root.findtext(".//res"))
+                    if not isinstance(result, int):
+                        raise TypeError(
+                            "Power safety response did not contain a numeric res"
+                        )
+                    if result != 0:
+                        raise PowerActionBlockedError(result)
+            except Exception as error:
+                _LOGGER.warning(
+                    "OS 5 power diagnostic: api_version=%s preflight_started=True "
+                    "phase=preflight exception_type=%s",
+                    self.version,
+                    type(error).__name__,
+                )
+                raise
 
             try:
                 async with self.session.post(
@@ -369,13 +368,35 @@ class client:
             except aiohttp.ServerDisconnectedError:
                 # The confirmed command may tear down HTTP before a response body.
                 return
+            except Exception as error:
+                _LOGGER.warning(
+                    "OS 5 power diagnostic: api_version=%s preflight_started=True "
+                    "phase=action exception_type=%s",
+                    self.version,
+                    type(error).__name__,
+                )
+                raise
+
+    def _has_current_os5_session_cookie(self, target_url: str) -> bool:
+        """Return whether this client's current HTTP session can send PHPSESSID."""
+        if self.session is None or getattr(self.session, "closed", False):
+            return False
+        cookies = self.session.cookie_jar.filter_cookies(URL(target_url))
+        session_cookie = cookies.get("PHPSESSID")
+        return bool(session_cookie is not None and session_cookie.value)
 
     async def reboot(self) -> None:
-        """Restart a supported OS 5 NAS using its authenticated HTTP session."""
+        """Restart a supported NAS using its authenticated HTTP session."""
+        if self.version == 4:
+            await self._v4.power_action("reboot")
+            return
         await self._power_action("cgi_restart")
 
     async def shutdown(self) -> None:
-        """Shut down a supported OS 5 NAS using its authenticated HTTP session."""
+        """Shut down a supported NAS using its authenticated HTTP session."""
+        if self.version == 4:
+            await self._v4.power_action("halt")
+            return
         await self._power_action("cgi_shutdown")
 
     async def system_information(self) -> dict:

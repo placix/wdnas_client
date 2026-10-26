@@ -9,10 +9,12 @@ Initially built for my Home Assistant integration [ha-mycloud](https://github.co
 ## Features
 * Fetches system info, share names, network status, and more.
 * Asynchronous library using `asyncio` and `client`.
-* Supports V2 and V5 WD NAS firmware and provisional V4 support for original
-  WD My Cloud OS 3 devices using the REST 2.1 XML API.
+* Supports V2 and V5 WD NAS firmware and original WD My Cloud OS 3 devices
+  through the V4 REST 2.1 XML API.
 * Reports OS 5 RAID diagnostics, detailed volume state, resource monitoring,
   process diagnostics, warning state, and NAS-reported internet connectivity.
+* Reuses authenticated V4 and supported OS 5 sessions for explicit restart and
+  shutdown actions without automatic retries.
 
 ---
 
@@ -61,6 +63,12 @@ async def main():
             print("System Information:", await wdNAS.system_information())
             print("Firmware Info:", await wdNAS.firmware_info())
             print("System State:", await wdNAS.system_state())
+            print("Storage Usage:", await wdNAS.storage_usage())
+            print("Internet Access:", await wdNAS.internet_access())
+
+            # Explicit device actions; never retry an uncertain result.
+            # await wdNAS.reboot()
+            # await wdNAS.shutdown()
 
         # V2 systems only
         if version == 2:
@@ -104,7 +112,7 @@ For more detailed information, please see the `docs` folder:
     * A list of all tested and compatible NAS models and firmware versions.
 
 * **[API Reference](./docs/API.md)**
-    * A detailed breakdown of the V2 and V5 API endpoints this integration uses.
+    * A detailed breakdown of the V2, V4, and V5 API endpoints.
 
 ## WD My Cloud Mirror (OS 5)
 
@@ -117,14 +125,13 @@ NAS returns
 error. The tested firmware returns HTTP 500 for the uptime endpoint, so callers
 should catch `UptimeUnavailableError` (which remains a subclass of
 `RequestFailedError`). See the API reference for response shapes and limits.
+Restart was successfully exercised on the physical Mirror. Shutdown uses the
+same WD JavaScript-derived safety flow but has not been executed on hardware.
 
 ## Original WD My Cloud V4 (OS 3 family)
 
-Model number `sq` with firmware `04.06.00-111` is a validation target. The
-device's authenticated browser session has manually confirmed the REST 2.1 XML
-resources `system_information`, `firmware_info`, and `system_state`. The client
-login and parsers are covered by offline response fixtures, but programmatic
-authentication has not yet been validated against the physical NAS. V4 login
-uses unencrypted HTTP query parameters, so it must be limited to a trusted local
-network. V4 power actions are not enabled because their original JavaScript was
-not available for verification.
+Model number `sq` with firmware `04.06.00-111` is hardware-tested for client
+login, monitoring, storage usage, internet status, session reuse, logout, and
+restart. Shutdown uses the same source-confirmed endpoint with `state=halt`, but
+has not been executed on hardware. V4 login uses unencrypted HTTP query
+parameters, so it must be limited to a trusted local network.

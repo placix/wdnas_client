@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from decimal import Decimal, InvalidOperation
 from xml.etree import ElementTree
 
 import aiohttp
 
-from .const import SCHEME, V4_ENDPOINTS
+from .const import POWER_ACTION_TIMEOUT, SCHEME, V4_ENDPOINTS
 from .exceptions import InvalidLoginError, RequestFailedError
 
 _CAPACITY_UNITS = {
@@ -205,6 +206,33 @@ class V4Adapter:
         if normalized == "false":
             return False
         raise ValueError("Invalid V4 internet connectivity value")
+
+    async def power_action(self, state: str) -> None:
+        """Send one source-confirmed V4 power action without retrying it."""
+        if state not in ("reboot", "halt"):
+            raise ValueError("Unsupported V4 power state")
+        if (
+            self._session is None
+            or getattr(self._session, "closed", False)
+            or not self._owner._authenticated
+        ):
+            raise InvalidLoginError("An authenticated V4 NAS session is required")
+
+        parameters = {"state": state}
+        async with asyncio.timeout(POWER_ACTION_TIMEOUT):
+            async with self._session.put(
+                self._url("shutdown"),
+                params=parameters,
+                data=parameters,
+                headers={"Accept": "application/xml", "Host": self._owner.host},
+            ) as response:
+                if response.status in (401, 403):
+                    raise InvalidLoginError(
+                        "The V4 NAS session is not authenticated", response.status
+                    )
+                if response.status != 200:
+                    raise RequestFailedError(response.status)
+                await response.text()
 
     async def system_info(self) -> dict:
         """Adapt V4 capacity to the existing public system-info structure."""

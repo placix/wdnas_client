@@ -24,17 +24,22 @@ their REST 2.1 XML API inside this project.
 
 | Function | HTTP Method | Endpoint | Parameters | Notes |
 | --- | --- | --- | --- | --- |
-| Login | `GET` | `/api/2.1/rest/local_login` | `username`, `password` query parameters | Implemented from firmware-interface evidence; physical client login validation pending |
+| Login | `GET` | `/api/2.1/rest/local_login` | `username`, `password` query parameters | Hardware-tested on model `sq`, firmware `04.06.00-111` |
 | System Information | `GET` | `/api/2.1/rest/system_information` | *None* | Identity and capacity label |
 | Firmware Info | `GET` | `/api/2.1/rest/firmware_info` | *None* | Current package name, version, and description |
 | System State | `GET` | `/api/2.1/rest/system_state` | *None* | Qualitative readiness and health strings |
+| Storage Usage | `GET` | `/api/2.1/rest/storage_usage` | *None* | Total, used, free, percentage, and optional media byte counters |
+| Internet Access | `GET` | `/api/2.1/rest/internet_access` | *None* | Boolean `connectivity` value |
+| Restart / Shutdown | `PUT` | `/api/2.1/rest/shutdown` | `state=reboot` or `state=halt` | Restart hardware-tested; shutdown not live-tested |
+| Logout | `GET` | `/api/2.1/rest/logout` | *None* | Exactly one server cleanup attempt |
 
 `system_information()`, `firmware_info()`, and `system_state()` expose the
 verified XML resources directly. The established `system_info()`,
 `device_info()`, `system_version()`, and `system_status()` methods adapt those
 responses for existing consumers. A capacity label such as `2TB` is converted
-to decimal bytes; unknown formats remain `None`. Used/free storage, CPU, memory,
-numeric temperature, disk topology, and volume topology remain unavailable.
+to decimal bytes; exact `storage_usage` counters take precedence when
+available. CPU, memory, numeric temperature, disk topology, and volume topology
+remain unavailable.
 
 V4 login maintains cookies in the existing `aiohttp.ClientSession`. HTTP 401
 and 403 responses become `InvalidLoginError`, including expired-session reads.
@@ -42,17 +47,15 @@ The client sanitizes login transport exceptions because the firmware sends the
 credentials in URL query parameters. Plain HTTP provides no confidentiality;
 use only on a trusted local network and avoid HTTP request logging.
 
-No V4 server-side logout endpoint has been established. Closing V4 therefore
-releases the local HTTP session only. Restart and shutdown are not implemented:
-the candidate `PUT /api/2.1/rest/shutdown` request could not be checked against
-the original JavaScript available in this workspace.
+V4 cleanup calls the source-confirmed logout endpoint once and closes local
+resources even when logout fails. Restart and shutdown reuse the authenticated
+session and issue exactly one `PUT` request without retry or method fallback.
 
 ## Version 5 Systems (V5)
 
 | Function | HTTP Method | Endpoint | Parameters / Body | Notes |
 | --- | --- | --- | --- | --- |
 | Login | `POST` | `/nas/v1/auth` | `{"username":"user1","password":"alisdh2309oas"}` | `application/json` body |
-| Logout | `DELETE` | `/nas/v1/auth` | *None* | Uses the current authenticated session cookies |
 | System Info | `GET` | `/xml/sysinfo.xml` | *None* | |
 | Share Names | `POST` | `/web/get_share_name_list.php` | *None* | |
 | System Status | `POST` | `/cgi-bin/status_mgr.cgi` | `cmd=resource` | `application/x-www-form-urlencoded` body |
@@ -78,13 +81,13 @@ the original JavaScript available in this workspace.
 
 ### `await nas.logout()` / `await nas.close()`
 
-For OS 5, `logout()` sends the same authenticated `DELETE /nas/v1/auth`
-request used by the WD web interface. It does not create a session and is safe
-to call repeatedly. `close()` first attempts that server-side logout and always
-closes the local `aiohttp.ClientSession`; a logout HTTP, timeout, or transport
-failure remains visible to the caller. Context-manager cleanup preserves an
-exception already being handled instead of replacing it with a secondary
-logout failure.
+For V4, `logout()` sends the source-confirmed `GET /api/2.1/rest/logout`
+request using the existing session. `close()` makes at most one logout attempt
+and always closes the local `aiohttp.ClientSession`; a logout HTTP, timeout, or
+transport failure remains visible to the caller.
+
+The protected historical OS 5 path closes its local HTTP session without
+introducing the later experimental logout/session-manager behavior.
 
 No equivalent OS 2 server endpoint has been established from the available WD
 sources. OS 2 `close()` therefore closes only the local HTTP session, while an
@@ -93,13 +96,16 @@ session was released.
 
 ### `await nas.reboot()` / `await nas.shutdown()`
 
-OS 5 only. Both methods first call the dashboard's read-only
+For OS 5, both methods first call the dashboard's read-only
 `cgi_Detect_Dangerous` check. A non-zero result raises
 `PowerActionBlockedError` and the action request is not sent. Only a specific
 `aiohttp.ServerDisconnectedError` after the action request is treated as the
 expected device transition; timeouts, HTTP failures, malformed safety replies,
 and other exceptions remain errors. These methods use the existing authenticated
 session and do not use SSH.
+
+For V4, the methods send one authenticated `PUT /api/2.1/rest/shutdown` with
+`state=reboot` or `state=halt`. They do not retry an ambiguous result.
 
 ### `await nas.diagnostics()`
 

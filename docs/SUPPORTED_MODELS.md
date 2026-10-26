@@ -38,8 +38,8 @@ other listed OS 5 models retain their existing support status.
 
 The Mirror dashboard source for firmware 5.33.102 confirms the safety-check,
 restart, and shutdown CGI commands implemented by `reboot()` and `shutdown()`.
-Only automated response fixtures were used for these destructive actions; they
-were deliberately not executed against the physical NAS.
+Restart was successfully tested on the physical NAS. Shutdown is implemented
+with the same safety flow but has not been executed on hardware.
 
 ## Version 4 Systems (V4 identifier)
 
@@ -48,17 +48,17 @@ V4 is this integration's identifier for original WD My Cloud devices in the OS
 
 | Model | Model number | Firmware | Support status | Validation |
 | --- | --- | --- | --- | --- |
-| WD My Cloud | `sq` | `04.06.00-111` | Provisional | Read endpoints manually verified in an authenticated browser; programmatic login and all parsing covered by offline mocks; independent hardware login still pending |
+| WD My Cloud | `sq` | `04.06.00-111` | &#10003; | Login, monitoring, storage, internet status, logout, and restart tested on real hardware; shutdown implemented but not live-tested |
 
-The verified browser endpoints are `/api/2.1/rest/system_information`,
-`/api/2.1/rest/firmware_info`, and `/api/2.1/rest/system_state`. The first
-provides identity and the `2TB` capacity label; the other resources provide
-firmware package data and qualitative health strings. No CPU, memory, used/free
-byte counters, numeric temperature, detailed disk list, or detailed volume list
-has been established, so the client does not fabricate them.
+The verified read endpoints include `/api/2.1/rest/system_information`,
+`firmware_info`, `system_state`, `storage_usage`, and `internet_access`.
+Storage values remain byte-accurate and qualitative health strings are not
+presented as numeric measurements. No CPU, memory, detailed disk list, or
+detailed volume list has been established, so the client does not fabricate
+them.
 
-The login endpoint is `/api/2.1/rest/local_login` with username and password
-query parameters. It is implemented and mock-tested, but physical-device
-authentication remains to be validated. HTTP does not encrypt these query
-parameters. No V4 server-side logout or power endpoint is enabled without the
-missing original JavaScript evidence.
+The login endpoint is `/api/2.1/rest/local_login`; server cleanup uses
+`GET /api/2.1/rest/logout`. Restart and shutdown use the source-confirmed
+`PUT /api/2.1/rest/shutdown` request with `state=reboot` or `state=halt`.
+HTTP does not encrypt the login query parameters. Restart is hardware-tested;
+shutdown remains intentionally untested on hardware.

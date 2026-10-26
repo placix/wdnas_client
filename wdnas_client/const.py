@@ -12,6 +12,7 @@ V4_ENDPOINTS = {
     "system_state": "/api/2.1/rest/system_state",
     "storage_usage": "/api/2.1/rest/storage_usage",
     "internet_access": "/api/2.1/rest/internet_access",
+    "shutdown": "/api/2.1/rest/shutdown",
 }
 
 ENDPOINTS = {

@@ -13,7 +13,6 @@ from wdnas_client.exceptions import (
     InvalidLoginError,
     PowerActionBlockedError,
     RequestFailedError,
-    SessionEstablishmentError,
     UptimeUnavailableError,
 )
 
@@ -33,11 +32,21 @@ class Headers(dict):
 
 
 class FakeResponse:
-    def __init__(self, status=200, text="", cookies=None, headers=None):
+    def __init__(
+        self,
+        status=200,
+        text="",
+        cookies=None,
+        headers=None,
+        history=None,
+        url=None,
+    ):
         self.status = status
         self._text = text
         self.cookies = cookies or http.cookies.SimpleCookie()
         self.headers = Headers(headers or {})
+        self.history = history or ()
+        self.url = URL(url) if url is not None else None
 
     async def __aenter__(self):
         return self
@@ -77,17 +86,29 @@ class FakeSession:
         cookies = self.cookie_jar.filter_cookies(URL(url))
         self.sent_cookies.append({key: morsel.value for key, morsel in cookies.items()})
 
+    def _next_response(self, url):
+        response = (
+            self.responses.pop(0) if self.responses is not None else self.response
+        )
+        if getattr(response, "url", None) is None:
+            response.url = URL(url)
+        return response
+
     def post(self, url, **kwargs):
         self._record("POST", url, kwargs)
-        return self.responses.pop(0) if self.responses is not None else self.response
+        return self._next_response(url)
 
     def get(self, url, **kwargs):
         self._record("GET", url, kwargs)
-        return self.responses.pop(0) if self.responses is not None else self.response
+        return self._next_response(url)
 
     def delete(self, url, **kwargs):
         self._record("DELETE", url, kwargs)
-        return self.responses.pop(0) if self.responses is not None else self.response
+        return self._next_response(url)
+
+    def put(self, url, **kwargs):
+        self._record("PUT", url, kwargs)
+        return self._next_response(url)
 
     async def close(self):
         self.closed = True
@@ -102,6 +123,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     def make_power_client(self, response, version=5):
         nas = self.make_client(response, version)
         nas.phpsessid = "session-id"
+        nas.session.cookie_jar.update_cookies({"PHPSESSID": "session-id"})
         return nas
 
     async def test_os5_login(self):
@@ -119,7 +141,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["json"]["username"], "admin")
         self.assertEqual(kwargs["json"]["password"], "c2VjcmV0")
 
-    async def test_os5_login_accepts_phpsessid_only_in_response_cookies(self):
+    async def test_os5_login_uses_historical_response_cookie_handling(self):
         cookies = http.cookies.SimpleCookie()
         cookies["PHPSESSID"] = "response-session"
         nas = self.make_client(FakeResponse(cookies=cookies))
@@ -127,12 +149,8 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         await nas.login()
 
         self.assertEqual(nas.phpsessid, "response-session")
-        jar_cookie = nas.session.cookie_jar.filter_cookies(
-            URL("http://nas.local/cgi-bin/system_mgr.cgi")
-        )["PHPSESSID"]
-        self.assertEqual(jar_cookie.value, "response-session")
 
-    async def test_os5_login_accepts_phpsessid_only_in_raw_set_cookie(self):
+    async def test_os5_login_uses_historical_raw_set_cookie_update(self):
         response = FakeResponse(
             headers={"Set-Cookie": "PHPSESSID=header-session; Path=/; HttpOnly"}
         )
@@ -140,73 +158,126 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
         await nas.login()
 
-        self.assertEqual(nas.phpsessid, "header-session")
+        # Commit 4e6389f updates the jar from the raw header, but deliberately
+        # only assigns ``phpsessid`` from ``response.cookies``.
+        self.assertIsNone(nas.phpsessid)
         jar_cookie = nas.session.cookie_jar.filter_cookies(
             URL("http://nas.local/cgi-bin/system_mgr.cgi")
         )["PHPSESSID"]
         self.assertEqual(jar_cookie.value, "header-session")
+        self.assertIsNone(nas.session.cookie_jar.updates[0][1])
 
-    async def test_os5_login_accepts_current_response_cookie_jar_fallback(self):
-        class AutoCookieSession(FakeSession):
-            def post(self, url, **kwargs):
-                response = super().post(url, **kwargs)
-                self.cookie_jar.update_cookies(
-                    {"PHPSESSID": "jar-session"}, response_url=URL(url)
-                )
-                return response
-
-        nas = client("Admin", "secret", "nas.local", 5)
-        nas.session = AutoCookieSession(FakeResponse())
-
-        await nas.login()
-
-        self.assertEqual(nas.phpsessid, "jar-session")
-
-    async def test_os5_ignores_preexisting_jar_cookie_as_login_proof(self):
-        nas = self.make_client(FakeResponse())
-        nas.session.cookie_jar.update_cookies(
-            {"PHPSESSID": "stale-session"},
-            response_url=URL("http://nas.local/nas/v1/auth"),
-        )
-
-        with self.assertRaises(SessionEstablishmentError):
-            await nas.login()
-
-        self.assertIsNone(nas.phpsessid)
-        self.assertEqual(len(nas.session.calls), 1)
-
-    async def test_os5_http_200_without_session_cookie_is_protocol_error(self):
-        nas = self.make_client(FakeResponse())
-        with self.assertRaises(SessionEstablishmentError) as caught:
-            await nas.login()
-        self.assertIsNone(caught.exception.cleanup_error)
-        self.assertEqual(len(nas.session.calls), 1)
-
-    async def test_os5_http_200_ambiguous_cleanup_failure_is_reported_once(self):
+    async def test_os5_power_uses_historical_jar_cookie_without_phpsessid(self):
         nas = self.make_client(
             [
-                FakeResponse(headers={"Set-Cookie": "NASFLAG=accepted; Path=/"}),
-                FakeResponse(status=503),
+                FakeResponse(
+                    headers={"Set-Cookie": "PHPSESSID=header-session; Path=/"}
+                ),
+                FakeResponse(text="<config><res>0</res></config>"),
+                FakeResponse(),
             ]
         )
 
-        with self.assertRaises(SessionEstablishmentError) as caught:
-            await nas.login()
+        await nas.login()
+        self.assertIsNone(nas.phpsessid)
+        await nas.reboot()
 
-        self.assertIsInstance(caught.exception.cleanup_error, RequestFailedError)
         self.assertEqual(
-            [call[:2] for call in nas.session.calls],
-            [
-                ("POST", "http://nas.local/nas/v1/auth"),
-                ("DELETE", "http://nas.local/nas/v1/auth"),
-            ],
+            [call[2].get("data") for call in nas.session.calls],
+            [None, "cmd=cgi_Detect_Dangerous", "cmd=cgi_restart"],
+        )
+        self.assertEqual(
+            sum(call[1].endswith("/nas/v1/auth") for call in nas.session.calls),
+            1,
         )
 
-    async def test_os5_401_and_403_are_explicit_authentication_failures(self):
+    async def test_os5_power_guard_uses_actual_cgi_cookie_path_on_ip_host(self):
+        jar = aiohttp.CookieJar(unsafe=True)
+        cookie = http.cookies.SimpleCookie()
+        cookie["PHPSESSID"] = "cgi-session"
+        cookie["PHPSESSID"]["path"] = "/cgi-bin"
+        jar.update_cookies(
+            cookie,
+            response_url=URL("http://192.0.2.10/cgi-bin/session-source"),
+        )
+        nas = client("Admin", "secret", "192.0.2.10", 5)
+        nas.session = FakeSession(
+            [FakeResponse(text="<config><res>0</res></config>"), FakeResponse()]
+        )
+        nas.session.cookie_jar = jar
+
+        await nas.reboot()
+
+        self.assertEqual(
+            [call[2]["data"] for call in nas.session.calls],
+            ["cmd=cgi_Detect_Dangerous", "cmd=cgi_restart"],
+        )
+
+    async def test_os5_power_guard_does_not_require_sendable_session_cookie(self):
+        for response_url, path in (
+            ("http://nas.local/nas/v1/auth", "/nas"),
+            ("http://other.local/cgi-bin/session-source", "/cgi-bin"),
+        ):
+            with self.subTest(response_url=response_url, path=path):
+                jar = aiohttp.CookieJar()
+                cookie = http.cookies.SimpleCookie()
+                cookie["PHPSESSID"] = "not-for-power-target"
+                cookie["PHPSESSID"]["path"] = path
+                jar.update_cookies(cookie, response_url=URL(response_url))
+                nas = self.make_client(
+                    [
+                        FakeResponse(text="<config><res>0</res></config>"),
+                        FakeResponse(),
+                    ]
+                )
+                nas.session.cookie_jar = jar
+
+                await nas.reboot()
+
+                self.assertEqual(
+                    [call[2]["data"] for call in nas.session.calls],
+                    ["cmd=cgi_Detect_Dangerous", "cmd=cgi_restart"],
+                )
+
+    async def test_os5_power_guard_diagnostic_contains_only_safe_metadata(self):
+        nas = client("Admin", "secret", "nas.local", 5)
+        nas.phpsessid = "never-log-session-value"
+
+        with (
+            self.assertLogs("wdnas_client", level="WARNING") as logs,
+            self.assertRaises(InvalidLoginError),
+        ):
+            await nas.reboot()
+
+        diagnostic = logs.output[0]
+        self.assertIn("api_version=5", diagnostic)
+        self.assertIn("session_present=False", diagnostic)
+        self.assertIn("session_closed=False", diagnostic)
+        self.assertIn("phpsessid_present=True", diagnostic)
+        self.assertIn("preflight_started=False", diagnostic)
+        self.assertIn("phase=session_guard", diagnostic)
+        self.assertIn("exception_type=InvalidLoginError", diagnostic)
+        self.assertNotIn("never-log-session-value", diagnostic)
+        self.assertNotIn("nas.local", diagnostic)
+
+    async def test_os5_http_200_without_cookie_keeps_historical_result(self):
+        response = FakeResponse(text='{"error":"ACCOUNT_IN_USE"}')
+        nas = self.make_client(response)
+
+        await nas.login()
+
+        self.assertIsNone(nas.phpsessid)
+        self.assertEqual(len(nas.session.calls), 1)
+        self.assertEqual(
+            [call[0] for call in nas.session.calls],
+            ["POST"],
+        )
+
+    async def test_os5_non_200_uses_historical_request_failure(self):
         for status in (401, 403):
             with self.subTest(status=status):
                 nas = self.make_client(FakeResponse(status=status))
-                with self.assertRaises(InvalidLoginError) as caught:
+                with self.assertRaises(RequestFailedError) as caught:
                     await nas.login()
                 self.assertEqual(caught.exception.status_code, status)
                 self.assertEqual(len(nas.session.calls), 1)
@@ -250,30 +321,30 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             ("GET", "http://nas.local/api/2.1/rest/logout"),
         )
 
-    async def test_client_cookie_jar_accepts_ip_host_session_cookies(self):
+    async def test_os5_context_uses_historical_default_client_session(self):
         nas = client("Admin", "secret", "192.0.2.10", 5)
+        cookies = http.cookies.SimpleCookie()
+        cookies["PHPSESSID"] = "opaque-session-value"
         session = FakeSession(
             FakeResponse(
-                headers={"Set-Cookie": "PHPSESSID=opaque-session-value; Path=/"}
+                cookies=cookies,
+                headers={"Set-Cookie": "PHPSESSID=opaque-session-value; Path=/"},
             )
         )
 
-        def session_factory(**kwargs):
-            session.cookie_jar = kwargs["cookie_jar"]
-            return session
-
         with patch(
-            "wdnas_client.aiohttp.ClientSession", side_effect=session_factory
+            "wdnas_client.aiohttp.ClientSession", return_value=session
         ) as constructor:
             await nas.__aenter__()
 
-        jar = constructor.call_args.kwargs["cookie_jar"]
-        filtered = jar.filter_cookies(URL("http://192.0.2.10/nas/v1/auth"))
-        self.assertEqual(filtered["PHPSESSID"].value, "opaque-session-value")
+        constructor.assert_called_once_with()
+        self.assertEqual(nas.phpsessid, "opaque-session-value")
         self.assertFalse(session.closed)
         await nas.close()
+        self.assertTrue(session.closed)
+        self.assertEqual([call[0] for call in session.calls], ["POST"])
 
-    async def test_os5_header_cookie_protects_device_info_and_logout(self):
+    async def test_os5_historical_cookie_jar_protects_device_info(self):
         device_xml = (
             "<config><serial_number>serial</serial_number><name>nas</name>"
             "<description>WD My Cloud Mirror</description></config>"
@@ -282,16 +353,11 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             [
                 FakeResponse(headers={"Set-Cookie": "PHPSESSID=same-session; Path=/"}),
                 FakeResponse(text=device_xml),
-                FakeResponse(status=200),
             ]
         )
         nas = client("Admin", "secret", "192.0.2.10", 5)
 
-        def session_factory(**kwargs):
-            session.cookie_jar = kwargs["cookie_jar"]
-            return session
-
-        with patch("wdnas_client.aiohttp.ClientSession", side_effect=session_factory):
+        with patch("wdnas_client.aiohttp.ClientSession", return_value=session):
             await nas.__aenter__()
             device = await nas.device_info()
             await nas.close()
@@ -302,12 +368,10 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             [
                 ("POST", "http://192.0.2.10/nas/v1/auth"),
                 ("POST", "http://192.0.2.10/cgi-bin/system_mgr.cgi"),
-                ("DELETE", "http://192.0.2.10/nas/v1/auth"),
             ],
         )
         self.assertEqual(session.sent_cookies[0], {})
         self.assertEqual(session.sent_cookies[1]["PHPSESSID"], "same-session")
-        self.assertEqual(session.sent_cookies[2]["PHPSESSID"], "same-session")
         self.assertEqual(
             sum(
                 call[1].endswith("/nas/v1/auth") and call[0] == "POST"
@@ -577,29 +641,19 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             "network_info",
             "accounts",
             "alerts",
-            "reboot",
-            "shutdown",
         ):
             with self.subTest(method=method_name), self.assertRaises(ValueError):
                 await getattr(nas, method_name)()
         self.assertEqual(nas.session.calls, [])
 
-    async def test_os5_logout_uses_proven_endpoint_and_existing_session(self):
+    async def test_os5_server_logout_is_not_added_to_historical_path(self):
         nas = self.make_power_client(FakeResponse(status=204))
 
-        await nas.logout()
+        with self.assertRaises(ValueError):
+            await nas.logout()
 
-        self.assertEqual(
-            nas.session.calls,
-            [
-                (
-                    "DELETE",
-                    "http://nas.local/nas/v1/auth",
-                    {"headers": {"Accept": "application/json", "Host": "nas.local"}},
-                )
-            ],
-        )
-        self.assertIsNone(nas.phpsessid)
+        self.assertEqual(nas.session.calls, [])
+        self.assertEqual(nas.phpsessid, "session-id")
         self.assertFalse(nas.session.closed)
 
     async def test_v4_logout_uses_source_confirmed_endpoint_once(self):
@@ -669,37 +723,30 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(nas.session.closed)
 
-    async def test_close_logs_out_then_closes_local_session(self):
+    async def test_os5_close_only_closes_local_session(self):
         nas = self.make_power_client(FakeResponse())
 
         await nas.close()
 
-        self.assertEqual(nas.session.calls[0][0], "DELETE")
+        self.assertEqual(nas.session.calls, [])
         self.assertTrue(nas.session.closed)
-        self.assertIsNone(nas.phpsessid)
+        self.assertEqual(nas.phpsessid, "session-id")
 
-    async def test_close_is_idempotent_and_concurrent_safe(self):
+    async def test_os5_close_never_sends_server_request(self):
         nas = self.make_power_client(FakeResponse())
 
         await asyncio.gather(nas.close(), nas.close(), nas.close())
         await nas.close()
 
-        self.assertEqual(
-            [call[0] for call in nas.session.calls].count("DELETE"),
-            1,
-        )
+        self.assertEqual(nas.session.calls, [])
+        self.assertTrue(nas.session.closed)
 
-    async def test_close_reports_logout_http_error_after_local_cleanup(self):
+    async def test_os5_close_does_not_consume_logout_response(self):
         nas = self.make_power_client(FakeResponse(status=503))
 
-        with self.assertRaises(RequestFailedError) as caught:
-            await nas.close()
-
-        self.assertEqual(caught.exception.status_code, 503)
+        await nas.close()
         self.assertTrue(nas.session.closed)
-        with self.assertRaises(RequestFailedError):
-            await nas.close()
-        self.assertEqual(len(nas.session.calls), 1)
+        self.assertEqual(nas.session.calls, [])
 
     async def test_context_exit_does_not_mask_original_exception(self):
         nas = self.make_power_client(FakeResponse(status=503))
@@ -728,20 +775,20 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await nas.logout()
 
-    async def test_failed_context_login_closes_local_session(self):
+    async def test_failed_os5_context_login_keeps_historical_cleanup_behavior(self):
         nas = client("Admin", "secret", "nas.local", 5)
         session = FakeSession(FakeResponse(status=401))
 
         with (
             patch("wdnas_client.aiohttp.ClientSession", return_value=session),
-            self.assertRaises(InvalidLoginError),
+            self.assertRaises(RequestFailedError),
         ):
             await nas.__aenter__()
 
-        self.assertTrue(session.closed)
+        self.assertFalse(session.closed)
         self.assertIsNone(nas.phpsessid)
 
-    async def test_failed_login_cleanup_does_not_mask_login_error(self):
+    async def test_failed_os5_login_does_not_invoke_new_cleanup_manager(self):
         class FailingCloseSession(FakeSession):
             async def close(self):
                 self.closed = True
@@ -752,54 +799,18 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("wdnas_client.aiohttp.ClientSession", return_value=session),
-            self.assertRaises(InvalidLoginError) as caught,
+            self.assertRaises(RequestFailedError) as caught,
         ):
             await nas.__aenter__()
 
         self.assertEqual(caught.exception.status_code, 401)
-        self.assertTrue(session.closed)
+        self.assertFalse(session.closed)
 
-    async def test_logout_timeout_closes_locally_and_is_not_reported_as_success(self):
-        class SlowDeleteResponse:
-            async def __aenter__(self):
-                await asyncio.Event().wait()
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                return False
-
-        nas = self.make_power_client(SlowDeleteResponse())
-
-        with (
-            patch("wdnas_client.SESSION_ACTION_TIMEOUT", 0.01),
-            self.assertRaises(TimeoutError),
-        ):
-            await nas.close()
-
-        self.assertTrue(nas.session.closed)
-
-    async def test_logout_disconnect_and_invalid_session_are_errors(self):
-        class DisconnectResponse:
-            async def __aenter__(self):
-                raise aiohttp.ServerDisconnectedError()
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                return False
-
-        disconnected = self.make_power_client(DisconnectResponse())
-        with self.assertRaises(aiohttp.ServerDisconnectedError):
-            await disconnected.close()
-        self.assertTrue(disconnected.session.closed)
-
-        invalid = self.make_power_client(FakeResponse(status=403))
-        with self.assertRaises(RequestFailedError) as caught:
-            await invalid.close()
-        self.assertEqual(caught.exception.status_code, 403)
-        self.assertTrue(invalid.session.closed)
-
-    async def test_logout_without_authenticated_session_does_not_log_in(self):
+    async def test_os5_logout_without_session_is_still_unsupported(self):
         nas = self.make_client(FakeResponse())
 
-        await nas.logout()
+        with self.assertRaises(ValueError):
+            await nas.logout()
 
         self.assertEqual(nas.session.calls, [])
 
@@ -1096,6 +1107,83 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         await nas.shutdown()
         self.assertEqual(nas.session.calls[1][2]["data"], "cmd=cgi_shutdown")
 
+    async def test_v4_reboot_uses_confirmed_put_and_existing_session(self):
+        nas = self.make_client(FakeResponse(text="<shutdown/>"), version=4)
+        nas._authenticated = True
+        nas.session.cookie_jar.update_cookies({"V4SESSION": "existing-session"})
+
+        await nas.reboot()
+
+        self.assertEqual(len(nas.session.calls), 1)
+        method, url, kwargs = nas.session.calls[0]
+        self.assertEqual(
+            (method, url),
+            ("PUT", "http://nas.local/api/2.1/rest/shutdown"),
+        )
+        self.assertEqual(kwargs["params"], {"state": "reboot"})
+        self.assertEqual(kwargs["data"], {"state": "reboot"})
+        self.assertEqual(nas.session.sent_cookies[0]["V4SESSION"], "existing-session")
+
+    async def test_v4_shutdown_uses_confirmed_put_without_login(self):
+        nas = self.make_client(FakeResponse(text="<shutdown/>"), version=4)
+        nas._authenticated = True
+
+        await nas.shutdown()
+
+        self.assertEqual(len(nas.session.calls), 1)
+        method, url, kwargs = nas.session.calls[0]
+        self.assertEqual(
+            (method, url),
+            ("PUT", "http://nas.local/api/2.1/rest/shutdown"),
+        )
+        self.assertEqual(kwargs["params"], {"state": "halt"})
+        self.assertEqual(kwargs["data"], {"state": "halt"})
+
+    async def test_v4_power_disconnect_is_ambiguous_and_never_retried(self):
+        class DisconnectResponse:
+            async def __aenter__(self):
+                raise aiohttp.ServerDisconnectedError()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        nas = self.make_client(DisconnectResponse(), version=4)
+        nas._authenticated = True
+
+        with self.assertRaises(aiohttp.ServerDisconnectedError):
+            await nas.reboot()
+
+        self.assertEqual(len(nas.session.calls), 1)
+        self.assertEqual(nas.session.calls[0][0], "PUT")
+
+    async def test_v4_power_timeout_is_ambiguous_and_never_retried(self):
+        class SlowResponse:
+            async def __aenter__(self):
+                await asyncio.Event().wait()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        nas = self.make_client(SlowResponse(), version=4)
+        nas._authenticated = True
+
+        with (
+            patch("wdnas_client.v4.POWER_ACTION_TIMEOUT", 0.01),
+            self.assertRaises(TimeoutError),
+        ):
+            await nas.shutdown()
+
+        self.assertEqual(len(nas.session.calls), 1)
+        self.assertEqual(nas.session.calls[0][0], "PUT")
+
+    async def test_v4_power_action_requires_existing_authenticated_session(self):
+        nas = self.make_client(FakeResponse(), version=4)
+
+        with self.assertRaises(InvalidLoginError):
+            await nas.reboot()
+
+        self.assertEqual(nas.session.calls, [])
+
     async def test_power_action_is_blocked_before_action_request(self):
         nas = self.make_power_client(FakeResponse(text="<config><res>2</res></config>"))
         with self.assertRaises(PowerActionBlockedError):
@@ -1127,7 +1215,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RequestFailedError):
             await nas.reboot()
 
-    async def test_power_actions_are_os5_only(self):
+    async def test_power_actions_remain_unsupported_for_os2(self):
         for method_name in ("reboot", "shutdown"):
             with self.subTest(method=method_name):
                 nas = self.make_client(FakeResponse(), version=2)
@@ -1188,11 +1276,32 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             ["cmd=cgi_Detect_Dangerous", "cmd=cgi_shutdown"],
         )
 
-    async def test_power_action_requires_authentication(self):
+    async def test_power_action_accepts_open_session_without_cookie(self):
         nas = self.make_client(FakeResponse(text="<config><res>0</res></config>"))
+        await nas.reboot()
+        self.assertEqual(
+            [call[2]["data"] for call in nas.session.calls],
+            ["cmd=cgi_Detect_Dangerous", "cmd=cgi_restart"],
+        )
+
+    async def test_power_action_does_not_trust_or_require_phpsessid_attribute(self):
+        nas = self.make_client(FakeResponse(text="<config><res>0</res></config>"))
+        nas.phpsessid = "attribute-only-session"
+
+        await nas.reboot()
+
+        self.assertEqual(len(nas.session.calls), 2)
+
+    async def test_power_action_rejects_missing_or_closed_http_session(self):
+        missing = client("Admin", "secret", "nas.local", 5)
         with self.assertRaises(InvalidLoginError):
-            await nas.reboot()
-        self.assertEqual(nas.session.calls, [])
+            await missing.reboot()
+
+        closed = self.make_power_client(FakeResponse())
+        closed.session.closed = True
+        with self.assertRaises(InvalidLoginError):
+            await closed.shutdown()
+        self.assertEqual(closed.session.calls, [])
 
     async def test_power_safety_http_error_never_sends_action(self):
         nas = self.make_power_client(FakeResponse(status=401))
